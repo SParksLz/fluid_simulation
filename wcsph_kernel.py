@@ -503,3 +503,88 @@ def update_collider_with_tri_mesh(
 
     x[tid] = particle_pos
     v[tid] = particle_vel
+
+# =========================sph->mesh============================
+
+@wp.kernel
+def rasterize_particles_to_nvdb_volume(
+    particles: wp.array(dtype=wp.vec3),
+    volume: wp.uint64,  # wp.Volume 的 id（用于坐标转换）
+    density_buffer: wp.array3d(dtype=float),  # 临时累积缓冲区
+    smoothing_length: float,
+    p_volume: float,
+    resolution_x: int,
+    resolution_y: int,
+    resolution_z: int,
+    debug_info: wp.array(dtype=wp.vec3)  # 调试信息：[0]=第一个粒子的体素索引, [1]=第一个粒子的位置, [2]=体素大小
+):
+    tid = wp.tid()
+    pos = particles[tid]
+    
+    # 使用 Volume 的坐标转换函数将世界坐标转换为体素索引
+    voxel_index_f = wp.volume_world_to_index(volume, pos)
+    voxel_center = wp.vec3i(
+        int(voxel_index_f[0]),
+        int(voxel_index_f[1]),
+        int(voxel_index_f[2])
+    )
+    
+    # 调试：记录第一个粒子的信息
+    if tid == 0:
+        debug_info[0] = voxel_index_f  # 体素索引（浮点）
+        debug_info[1] = pos  # 粒子位置
+        voxel_size_vec = wp.volume_index_to_world_dir(volume, wp.vec3(1.0, 0.0, 0.0))
+        debug_info[2] = voxel_size_vec  # 体素大小向量
+    
+    # 获取体素大小（用于计算影响范围）
+    voxel_size_vec = wp.volume_index_to_world_dir(volume, wp.vec3(1.0, 0.0, 0.0))
+    voxel_size = wp.length(voxel_size_vec)
+    
+    # 计算影响的体素范围
+    kernel_size = int(smoothing_length / voxel_size) + 1
+    
+    # 调试：记录第一个粒子影响的体素数量
+    affected_count = int(0)
+    
+    for dx in range(-kernel_size, kernel_size + 1):
+        for dy in range(-kernel_size, kernel_size + 1):
+            for dz in range(-kernel_size, kernel_size + 1):
+                vx = voxel_center[0] + dx
+                vy = voxel_center[1] + dy
+                vz = voxel_center[2] + dz
+                
+                # 检查边界（使用 density_buffer 的分辨率）
+                if 0 <= vx < resolution_x and 0 <= vy < resolution_y and 0 <= vz < resolution_z:
+                    # 计算体素中心的世界坐标
+                    voxel_center_world = wp.volume_index_to_world(volume, wp.vec3(float(vx), float(vy), float(vz)))
+                    distance = wp.length(pos - voxel_center_world)
+                    
+                    if distance < smoothing_length:
+                        weight = get_cubic(distance, smoothing_length)
+                        density_contribution = weight * p_volume
+                        # 使用原子操作累加到 density_buffer
+                        wp.atomic_add(density_buffer, vx, vy, vz, density_contribution)
+                        affected_count += 1
+@wp.kernel
+def copy_density_to_volume(
+    density_buffer: wp.array3d(dtype=float),
+    volume: wp.uint64,
+    resolution_x: int,
+    resolution_y: int,
+    resolution_z: int
+):
+    i, j, k = wp.tid()
+    if i < resolution_x and j < resolution_y and k < resolution_z:
+        density_value = density_buffer[i, j, k]
+        if density_value > 0.0:  # 只写入非零值（Volume 是稀疏的）
+            wp.volume_store_f(volume, i, j, k, density_value)
+
+
+@wp.kernel
+def write_sphere(volume: wp.uint64, center: wp.vec3, radius: float):
+    i, j, k = wp.tid()
+
+    p = wp.volume_index_to_world(volume, wp.vec3f(float(i), float(j), float(k)))
+    d = wp.length(p - center) - radius
+
+    wp.volume_store_f(volume, i, j, k, -d)
