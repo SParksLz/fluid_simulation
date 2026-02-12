@@ -72,8 +72,8 @@ class wcsph:
 
         # fluid material
         self.sph_model.liquid_material.tension = 0.01
-        self.sph_model.liquid_material.stiffness = 35000.0
-        self.sph_model.liquid_material.mu = 1.5
+        self.sph_model.liquid_material.stiffness = 85000.0
+        self.sph_model.liquid_material.mu = 3.0
 
         self.p_volume = 0.8 * (self.particle_distance ** 3)
         self.sub_step_num = 6
@@ -89,7 +89,7 @@ class wcsph:
         # self.volume_density = None  # 将在 render 中创建
         # self.volume_threshold = 0.3  # 等值面阈值，可根据密度调整
         margin_scale = 2.0
-        voxel_size = self.smoothing_length *  0.25
+        voxel_size = self.smoothing_length *  0.5
         margin = self.smoothing_length * margin_scale
 
         self.world_min = wp.vec3(-self.bound_3d_size[0] - margin, -self.bound_3d_size[1] - margin, 0.0 - margin)
@@ -134,7 +134,7 @@ class wcsph:
         #     device="cuda:0"
         # )
         
-        self.volume_threshold = 0.1  # 等值面阈值，可根据密度调整
+        self.volume_threshold = 0.5  # 等值面阈值，可根据密度调整
 
 
 
@@ -366,21 +366,9 @@ class wcsph:
                 inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)])
             
             self.renderer.begin_frame(self.sim_time)
-            # print("self.x (前几个值):", self.x.numpy()[:5])
-            # print("self.render_x (前几个值):", self.render_x.numpy()[:5])
-            # self.renderer.render_points(
-            #     points=self.render_x.numpy(), radius=0.0003, name="points", colors=(0.2, 0.3, 0.7)
-            # )
-            # breakpoint()
+
 
             render_x_np = self.render_x.numpy()
-            # print(render_x_np.shape)
-
-            # volume = wp.Volume.load_from_numpy(
-            #     render_x_np, 
-            #     voxel_size = self.particle_radius * 0.01,
-            #     device = "cuda:0"
-            # )
 
             
             self.renderer.render_points(
@@ -389,11 +377,6 @@ class wcsph:
                 name="points", 
                 colors=(0.2, 0.3, 0.7)
             )
-            # self.renderer.render_mesh(
-            #     name = "container",
-            #     points=self.collider.points.numpy(),
-            #     indices=self.collider.indices.numpy(),
-            # )
             self.renderer.end_frame()
 
     def render(self):
