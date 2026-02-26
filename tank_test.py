@@ -6,6 +6,92 @@ from wcsph_kernel import *
 import math
 from pxr import Usd, UsdGeom, Vt, Sdf
 from pathlib import Path
+from collections import defaultdict
+
+
+def _gaussian_1d_weights(radius: int, sigma: float) -> np.ndarray:
+    """1D 高斯核权重，长度 2*radius+1，已归一化。"""
+    n = 2 * radius + 1
+    x = np.arange(n, dtype=np.float64) - radius
+    w = np.exp(-0.5 * (x / sigma) ** 2)
+    w /= w.sum()
+    return w.astype(np.float32)
+
+
+def _build_mesh_adjacency(indices: np.ndarray, n_verts: int):
+    """从三角面片索引构建顶点邻接：adj_offsets[i+1]-adj_offsets[i] = 顶点 i 的邻居数，adj_flat 为展平的邻居索引。"""
+    indices = np.asarray(indices, dtype=np.int32)
+    if indices.ndim == 1:
+        indices = indices.reshape(-1, 3)
+    adj = defaultdict(set)
+    for tri in indices:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        adj[a].add(b)
+        adj[a].add(c)
+        adj[b].add(a)
+        adj[b].add(c)
+        adj[c].add(a)
+        adj[c].add(b)
+    adj_offsets = np.zeros(n_verts + 1, dtype=np.int32)
+    for i in range(n_verts):
+        adj_offsets[i + 1] = adj_offsets[i] + len(adj.get(i, set()))
+    adj_flat = np.zeros(adj_offsets[-1], dtype=np.int32)
+    pos = np.zeros(n_verts, dtype=np.int32)
+    for i in range(n_verts):
+        for j in sorted(adj.get(i, set())):
+            adj_flat[adj_offsets[i] + pos[i]] = j
+            pos[i] += 1
+    return adj_offsets, adj_flat
+
+
+def _laplacian_smooth_mesh_gpu(verts: np.ndarray, indices: np.ndarray, iterations: int = 2, lambda_factor: float = 0.5, device: str = "cuda:0") -> np.ndarray:
+    """在 GPU 上并行做拉普拉斯平滑（Warp kernel）。"""
+    n_verts = verts.shape[0]
+    if n_verts == 0:
+        return verts
+    adj_offsets, adj_flat = _build_mesh_adjacency(indices, n_verts)
+    verts_wp = wp.array(verts.astype(np.float32), dtype=wp.vec3, device=device)
+    new_verts_wp = wp.empty(n_verts, dtype=wp.vec3, device=device)
+    adj_offsets_wp = wp.array(adj_offsets, dtype=wp.int32, device=device)
+    adj_flat_wp = wp.array(adj_flat, dtype=wp.int32, device=device)
+    for _ in range(iterations):
+        wp.launch(
+            kernel=laplacian_smooth_kernel,
+            dim=n_verts,
+            inputs=[verts_wp, new_verts_wp, adj_offsets_wp, adj_flat_wp, float(lambda_factor)],
+            device=device,
+        )
+        verts_wp, new_verts_wp = new_verts_wp, verts_wp
+    return verts_wp.numpy()
+
+
+def _laplacian_smooth_mesh(verts: np.ndarray, indices: np.ndarray, iterations: int = 2, lambda_factor: float = 0.5) -> np.ndarray:
+    """对三角 mesh 做拉普拉斯平滑（CPU 版本，保留作备用）。"""
+    verts = np.asarray(verts, dtype=np.float64)
+    indices = np.asarray(indices, dtype=np.int32)
+    if indices.ndim == 1:
+        indices = indices.reshape(-1, 3)
+    n_verts = verts.shape[0]
+    adj = defaultdict(set)
+    for tri in indices:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+        adj[a].add(b)
+        adj[a].add(c)
+        adj[b].add(a)
+        adj[b].add(c)
+        adj[c].add(a)
+        adj[c].add(b)
+    for _ in range(iterations):
+        new_verts = verts.copy()
+        for i in range(n_verts):
+            nei = list(adj.get(i, ()))
+            if len(nei) == 0:
+                continue
+            mean_nei = verts[nei].mean(axis=0)
+            new_verts[i] = verts[i] + lambda_factor * (mean_nei - verts[i])
+        verts = new_verts
+    return verts.astype(np.float32)
+
 
 class sph_material:
     def __init__(self, 
@@ -44,8 +130,8 @@ class wcsph:
         self.verbose = False
         self.load_from_usd = load_from_usd
         self.sim_time = 0.0
-        self.sim_dt = 0.005
-        
+        self.sim_dt = 1.0 / 60.0
+        self.device = "cuda:0"
 
         # self.particle_radius = 0.0125
         self.particle_radius : float = 0.0
@@ -62,7 +148,7 @@ class wcsph:
             self.n = int(
                 self.bound_size * self.bound_size * self.bound_size / (self.smoothing_length**3)
             )  # number particles (small box in corner)
-            self.x = wp.empty(self.n, dtype=wp.vec3)
+            self.x = wp.empty(self.n, dtype=wp.vec3, device=self.device)
 
 
         self.particle_distance = self.particle_radius * 2.0
@@ -71,12 +157,12 @@ class wcsph:
         self.sph_model = sph_model(self.bound_size, self.smoothing_length)
 
         # fluid material
-        self.sph_model.liquid_material.tension = 0.01
+        self.sph_model.liquid_material.tension = 0.5
         self.sph_model.liquid_material.stiffness = 85000.0
         self.sph_model.liquid_material.mu = 3.0
 
         self.p_volume = 0.8 * (self.particle_distance ** 3)
-        self.sub_step_num = 6
+        self.sub_step_num = 4
         self.gravity = -10.0
 
         self.camera_pos = (0.0, 8.5, 5.0)
@@ -89,12 +175,13 @@ class wcsph:
         # self.volume_density = None  # 将在 render 中创建
         # self.volume_threshold = 0.3  # 等值面阈值，可根据密度调整
         margin_scale = 2.0
-        voxel_size = self.smoothing_length *  0.5
+        voxel_size = self.smoothing_length *  0.65
         margin = self.smoothing_length * margin_scale
 
         self.world_min = wp.vec3(-self.bound_3d_size[0] - margin, -self.bound_3d_size[1] - margin, 0.0 - margin)
-        self.world_max = wp.vec3(self.bound_3d_size[0] + margin, self.bound_3d_size[1] + margin, self.bound_3d_size[2] + margin)
+        self.world_max = wp.vec3(self.bound_3d_size[0] + margin, self.bound_3d_size[1] + margin, (self.bound_3d_size[2] * 2) + margin)
         size = self.world_max - self.world_min
+        # size[2] = size[2] * 2.0
 
         self.volume_res_x = int(math.ceil(size[0] / voxel_size))
         self.volume_res_y = int(math.ceil(size[1] / voxel_size))
@@ -122,7 +209,6 @@ class wcsph:
         # volume_size_y = (self.bound_3d_size[1] + 0.2) * 2.0
         # volume_size_z = (self.bound_3d_size[2] + 0.2)* 2.0
 
-        self.target_voxel_size = self.smoothing_length *  0.5  # 可以根据需要调整这个系数
 
         # resolution_scale = 0.5
     
@@ -134,30 +220,40 @@ class wcsph:
         #     device="cuda:0"
         # )
         
-        self.volume_threshold = 0.5  # 等值面阈值，可根据密度调整
+        self.volume_threshold = 0.55  # 等值面阈值，可根据密度调整
+        self.volume_smooth_iters = 1  # 对 density volume 做 3D 可分离高斯模糊的遍数（每遍 = x+y+z 三向）
+        self.volume_gaussian_radius = 1  # 1D 高斯核半径（半宽），核长 2*radius+1
+        self.volume_gaussian_sigma = 1.0  # 1D 高斯 sigma
 
 
 
         print(f"particle count : {self.n}")
-        self.mass = wp.full(self.n, self.p_volume * self.sph_model.liquid_material.rho)
-        self.gamma = wp.full(self.n, self.sph_model.liquid_material.tension)
-        self.stiffness = wp.full(self.n, self.sph_model.liquid_material.stiffness)
-        self.exponent = wp.full(self.n, self.sph_model.liquid_material.exponent)
-        self.mu = wp.full(self.n, self.sph_model.liquid_material.mu)
-        self.rho_0 = wp.full(self.n, self.sph_model.liquid_material.rho)
+        dev = self.device
+        self.mass = wp.full(self.n, self.p_volume * self.sph_model.liquid_material.rho, device=dev)
+        self.gamma = wp.full(self.n, self.sph_model.liquid_material.tension, device=dev)
+        self.stiffness = wp.full(self.n, self.sph_model.liquid_material.stiffness, device=dev)
+        self.exponent = wp.full(self.n, self.sph_model.liquid_material.exponent, device=dev)
+        self.mu = wp.full(self.n, self.sph_model.liquid_material.mu, device=dev)
+        self.rho_0 = wp.full(self.n, self.sph_model.liquid_material.rho, device=dev)
 
+        self.v = wp.zeros(self.n, dtype=wp.vec3, device=dev)
+        self.rho = wp.zeros(self.n, dtype=float, device=dev)
+        self.a = wp.zeros(self.n, dtype=wp.vec3, device=dev)
+        self.nei_count = wp.zeros(self.n, dtype=wp.int32, device=dev)
+        self.pressure = wp.zeros(self.n, dtype=float, device=dev)
+        self.factor = wp.zeros(self.n, dtype=float, device=dev)
 
+        self.use_dfsph = True
+        self.v_star = wp.empty(self.n, dtype=wp.vec3, device=dev)
+        self.rho_star = wp.zeros(self.n, dtype=float, device=dev)
+        self.d_rho_dt = wp.zeros(self.n, dtype=float, device=dev)
+        self.kappa = wp.zeros(self.n, dtype=float, device=dev)
+        self.dfsph_eta_density = 1e-4 * self.sph_model.liquid_material.rho
+        self.dfsph_eta_divergence = 1e-4
+        self.dfsph_max_iters_density = 20
+        self.dfsph_max_iters_divergence = 10
 
-
-
-        self.v = wp.zeros(self.n, dtype=wp.vec3)
-        self.rho = wp.zeros(self.n, dtype=float)
-        self.a = wp.zeros(self.n, dtype=wp.vec3)
-        self.nei_count = wp.zeros(self.n, dtype=wp.int32)
-        self.pressure = wp.zeros(self.n, dtype=float)
-        self.factor = wp.zeros(self.n, dtype=float)
-
-        self.render_x = wp.empty(self.n, dtype=wp.vec3)
+        self.render_x = wp.empty(self.n, dtype=wp.vec3, device=dev)
 
         # set random positions
         # wp.launch(
@@ -218,86 +314,292 @@ class wcsph:
 
     def sub_step(self) :
         # self.compute_sim_dt(self.sim_dt * 0.9, self.sim_dt * 1.1)
-        with wp.ScopedTimer("grid build", active=False):
-                    # build grid
-            self.sph_model.grid.build(self.x, self.smoothing_length)
-            wp.launch(
-                kernel=get_neighbor,
-                dim=self.n,
-                inputs=[
-                    self.sph_model.grid.id,
-                    self.x,
-                    self.smoothing_length,
-                    self.nei_count,
-                ]
-            )
-        with wp.ScopedTimer("calculate density", active = self.verbose) :
+        def _wcsph_substep() :
+            with wp.ScopedTimer("grid build", active=False):
+                        # build grid
+                self.sph_model.grid.build(self.x, self.smoothing_length)
+                wp.launch(
+                    kernel=get_neighbor,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.smoothing_length,
+                        self.nei_count,
+                    ]
+                )
+            with wp.ScopedTimer("calculate density", active = self.verbose) :
 
+                wp.launch(
+                    kernel=rho,
+                    dim=self.n,
+                    inputs=[
+                        self.rho,
+                        self.exponent,
+                        self.stiffness,
+                        self.x,
+                        self.rho_0,
+                        self.p_volume,
+                        self.smoothing_length,
+                        self.sph_model.grid.id,
+                        self.pressure,
+                    ]
+                )
+            with wp.ScopedTimer("calculate acceleration", active = self.verbose) :
+                wp.launch(
+                    kernel=acceleration,
+                    dim=self.n,
+                    inputs=[
+                        self.x,
+                        self.v,
+                        self.rho_0,
+                        self.rho,
+                        self.a,
+                        self.particle_radius,
+                        self.stiffness,
+                        self.exponent,
+                        self.pressure,
+                        self.p_volume,
+                        self.mass,
+                        self.gamma,
+                        self.mu,
+                        self.gravity,
+                        self.smoothing_length,
+                        self.sph_model.grid.id,
+                    ]
+                )
+            # # kick
+            wp.launch(kernel=kick, dim=self.n, inputs=[self.v, self.a, self.sim_dt])
+
+            # # drift
+            wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v, self.sim_dt])
+            # # ground collision
+            wp.launch(kernel=apply_bounds, dim=self.n, inputs=[self.x, self.v ,self.bound_3d_size ,-0.1])
+            # wp.launch(
+            #     kernel=update_collider_with_tri_mesh, 
+            #     dim=self.n, 
+            #     inputs=[
+            #         self.x, 
+            #         self.v, 
+            #         self.collider.id, 
+            #         self.particle_radius, 
+            #         0.9, 0.1],
+            # )
             wp.launch(
-                kernel=rho,
+                kernel=to_real_world,
+                dim=self.n,
+                inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)])
+        def _dfsph_substep():
+            dev = self.device
+            dt = float(self.sim_dt)
+            print(dt)
+            # 1) 邻居
+            with wp.ScopedTimer("grid build", active=False):
+                self.sph_model.grid.build(self.x, self.smoothing_length)
+                wp.launch(
+                    kernel=get_neighbor,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.smoothing_length,
+                        self.nei_count,
+                    ],
+                    device=dev,
+                )
+            # 2) 密度 ρ 与因子 α（论文 Algorithm 1：每步开始时的 ρ、α）
+            with wp.ScopedTimer("density and factor", active=self.verbose):
+                wp.launch(
+                    kernel=rho_dfsph,
+                    dim=self.n,
+                    inputs=[
+                        self.rho,
+                        self.x,
+                        self.rho_0,
+                        self.p_volume,
+                        self.smoothing_length,
+                        self.sph_model.grid.id,
+                    ],
+                    device=dev,
+                )
+                wp.launch(
+                    kernel=compute_factor_dfsph,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.mass,
+                        self.smoothing_length,
+                        self.factor,
+                    ],
+                    device=dev,
+                )
+            # 3) 非压力力 F_adv，预测速度 v* = v + Δt F_adv/m
+            with wp.ScopedTimer("non-pressure forces", active=self.verbose):
+                wp.launch(
+                    kernel=acceleration_non_pressure,
+                    dim=self.n,
+                    inputs=[
+                        self.x,
+                        self.v,
+                        self.rho_0,
+                        self.rho,
+                        self.a,
+                        self.particle_radius,
+                        self.mass,
+                        self.gamma,
+                        self.mu,
+                        self.gravity,
+                        self.smoothing_length,
+                        self.sph_model.grid.id,
+                    ],
+                    device=dev,
+                )
+            wp.launch(
+                kernel=predict_velocity,
+                dim=self.n,
+                inputs=[self.v, self.a, dt, self.v_star],
+                device=dev,
+            )
+            # 4) 常数密度修正 (Algorithm 3)：至少 2 次迭代
+            for _ in range(self.dfsph_max_iters_density):
+                wp.launch(
+                    kernel=compute_density_change_rate,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.v_star,
+                        self.mass,
+                        self.smoothing_length,
+                        self.d_rho_dt,
+                    ],
+                    device=dev,
+                )
+                wp.launch(
+                    kernel=predict_density_star,
+                    dim=self.n,
+                    inputs=[self.rho, self.d_rho_dt, dt, self.rho_star],
+                    device=dev,
+                )
+                wp.launch(
+                    kernel=compute_kappa_density,
+                    dim=self.n,
+                    inputs=[
+                        self.rho_star,
+                        self.rho_0,
+                        self.factor,
+                        dt,
+                        self.kappa,
+                    ],
+                    device=dev,
+                )
+                wp.launch(
+                    kernel=apply_constant_density_correction,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.v_star,
+                        self.mass,
+                        self.rho,
+                        self.rho_0,
+                        self.kappa,
+                        self.smoothing_length,
+                        dt,
+                    ],
+                    device=dev,
+                )
+            # 5) 更新位置 x = x + Δt v*
+            wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v_star, dt], device=dev)
+            # 6) 位置更新后重新算邻居、ρ、α（论文 line 16–20）
+            with wp.ScopedTimer("grid build", active=False):
+                self.sph_model.grid.build(self.x, self.smoothing_length)
+            wp.launch(
+                kernel=rho_dfsph,
                 dim=self.n,
                 inputs=[
                     self.rho,
-                    self.exponent,
-                    self.stiffness,
                     self.x,
                     self.rho_0,
                     self.p_volume,
                     self.smoothing_length,
                     self.sph_model.grid.id,
-                    self.pressure,
-                ]
+                ],
+                device=dev,
             )
-        with wp.ScopedTimer("calculate acceleration", active = self.verbose) :
             wp.launch(
-                kernel=acceleration,
+                kernel=compute_factor_dfsph,
                 dim=self.n,
                 inputs=[
+                    self.sph_model.grid.id,
                     self.x,
-                    self.v,
-                    self.rho_0,
-                    self.rho,
-                    self.a,
-                    self.particle_radius,
-                    self.stiffness,
-                    self.exponent,
-                    self.pressure,
-                    self.p_volume,
                     self.mass,
-                    self.gamma,
-                    self.mu,
-                    self.gravity,
                     self.smoothing_length,
-                    self.sph_model.grid.id,
-                ]
+                    self.factor,
+                ],
+                device=dev,
             )
-        # # kick
-        wp.launch(kernel=kick, dim=self.n, inputs=[self.v, self.a, self.sim_dt])
-
-        # # drift
-        wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v, self.sim_dt])
-        # # ground collision
-        wp.launch(kernel=apply_bounds, dim=self.n, inputs=[self.x, self.v ,self.bound_3d_size ,-0.1])
-        # wp.launch(
-        #     kernel=update_collider_with_tri_mesh, 
-        #     dim=self.n, 
-        #     inputs=[
-        #         self.x, 
-        #         self.v, 
-        #         self.collider.id, 
-        #         self.particle_radius, 
-        #         0.9, 0.1],
-        # )
-        wp.launch(
-            kernel=to_real_world,
-            dim=self.n,
-            inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)])
+            # 7) 散度自由修正 (Algorithm 2)：至少 1 次迭代
+            for _ in range(self.dfsph_max_iters_divergence):
+                wp.launch(
+                    kernel=compute_density_change_rate,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.v_star,
+                        self.mass,
+                        self.smoothing_length,
+                        self.d_rho_dt,
+                    ],
+                    device=dev,
+                )
+                wp.launch(
+                    kernel=compute_kappa_divergence,
+                    dim=self.n,
+                    inputs=[self.d_rho_dt, self.rho, self.factor, dt, self.kappa],
+                    device=dev,
+                )
+                wp.launch(
+                    kernel=apply_divergence_free_correction,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.v_star,
+                        self.mass,
+                        self.rho,
+                        self.rho_0,
+                        self.kappa,
+                        self.smoothing_length,
+                        dt,
+                    ],
+                    device=dev,
+                )
+            # 8) v = v*，边界与渲染坐标
+            wp.launch(kernel=copy_velocity, dim=self.n, inputs=[self.v_star, self.v], device=dev)
+            wp.launch(
+                kernel=apply_bounds,
+                dim=self.n,
+                inputs=[self.x, self.v, self.bound_3d_size, -0.1],
+                device=dev,
+            )
+            wp.launch(
+                kernel=to_real_world,
+                dim=self.n,
+                inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)],
+                device=dev,
+            )
+        if self.use_dfsph:
+            _dfsph_substep()
+        else:
+            _wcsph_substep()
 
     def preparation(self) :
         with wp.ScopedTimer("preparation", active=True):
-                    # build grid
+            dev = self.device
             self.sph_model.grid.build(self.x, self.smoothing_length)
-
             wp.launch(
                 kernel=get_neighbor,
                 dim=self.n,
@@ -306,36 +608,48 @@ class wcsph:
                     self.x,
                     self.smoothing_length,
                     self.nei_count,
-                ]
+                ],
+                device=dev,
             )
-
+            # 初始密度：写入 self.rho，并传入 grid_id
             wp.launch(
-                kernel=rho,
+                kernel=rho_dfsph,
                 dim=self.n,
                 inputs=[
                     self.rho,
-                    self.exponent,
-                    self.stiffness,
                     self.x,
                     self.rho_0,
                     self.p_volume,
                     self.smoothing_length,
                     self.sph_model.grid.id,
-                    self.pressure,
-                ]
+                ],
+                device=dev,
             )
-
-            wp.launch(
-                kernel=compute_factor,
-                dim=self.n,
-                inputs=[
-                    self.sph_model.grid.id,
-                    self.x,
-                    self.smoothing_length,
-                    self.p_volume,
-                    self.factor,
-                ]
-            )
+            if self.use_dfsph:
+                wp.launch(
+                    kernel=compute_factor_dfsph,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.mass,
+                        self.smoothing_length,
+                        self.factor,
+                    ],
+                    device=dev,
+                )
+            # else:
+            #     wp.launch(
+            #         kernel=compute_factor,
+            #         dim=self.n,
+            #         inputs=[
+            #             self.sph_model.grid.id,
+            #             self.x,
+            #             self.smoothing_length,
+            #             self.p_volume,
+            #             self.factor,
+            #         ],
+            #     )
         # print("----rho-----")
         # print(self.rho)
         # print("-----factor-----")
@@ -380,7 +694,7 @@ class wcsph:
             self.renderer.end_frame()
 
     def render(self):
-        with wp.ScopedTimer("render", active=False):
+        with wp.ScopedTimer("render", active=True):
             # 在渲染之前更新 render_x，确保使用最新的位置
             wp.launch(
                 kernel=to_real_world,
@@ -420,79 +734,6 @@ class wcsph:
                 ],
                 device="cuda:0"
             )
-
-            # wp.launch(
-            #     kernel=write_sphere,
-            #     dim=(self.volume_res_x, self.volume_res_y, self.volume_res_z),
-            #     inputs=[
-            #         self.volume.id,
-            #         wp.vec3(0.0, 0.0, 0.0),
-            #         self.smoothing_length,
-            #     ],
-            # )
-
-            # wp.launch(
-            #     kernel=copy_density_to_volume,
-            #     dim = (self.volume_res_x, self.volume_res_y, self.volume_res_z),
-            #     inputs=[
-            #         density_buffer,
-            #         self.volume.id,
-            #         self.volume_res_x,
-            #         self.volume_res_y,
-            #         self.volume_res_z,
-            #     ],
-            #     device="cuda:0",
-            # )
-            
-            # 打印调试信息
-            # debug_np = debug_info.numpy()
-            # print("=== 调试信息 ===")
-            # print(f"第一个粒子的位置: {debug_np[1]}")
-            # print(f"第一个粒子的体素索引: {debug_np[0]}")
-            # print(f"体素大小向量: {debug_np[2]}")
-            # print(f"体素大小标量: {np.linalg.norm(debug_np[2])}")
-            # print(f"粒子数量: {self.n}")
-            # print(f"Volume 分辨率: ({self.volume_res_x}, {self.volume_res_y}, {self.volume_res_z})")
-            # print(f"smoothing_length: {self.smoothing_length * 0.01}")
-            # print(f"p_volume: {self.p_volume}")
-            
-            # # 检查 density_buffer 是否有非零值
-            # density_np = density_buffer.numpy()
-            # non_zero_count = np.count_nonzero(density_np)
-            # print(f"density_buffer 非零值数量: {non_zero_count}")
-            # if non_zero_count > 0:
-            #     print(f"density_buffer 最大值: {np.max(density_np)}")
-            #     print(f"density_buffer 最小值（非零）: {np.min(density_np[density_np > 0])}")
-            # else:
-            #     print("警告: density_buffer 全为 0！")
-            
-            # # 检查粒子位置是否在 Volume 范围内
-            # if self.n > 0:
-            #     first_particle_pos = debug_np[1]
-            #     voxel_idx = debug_np[0]
-            #     print(f"第一个粒子体素索引范围检查:")
-            #     print(f"  vx: {voxel_idx[0]} (范围: 0-{self.volume_res_x-1})")
-            #     print(f"  vy: {voxel_idx[1]} (范围: 0-{self.volume_res_y-1})")
-            #     print(f"  vz: {voxel_idx[2]} (范围: 0-{self.volume_res_z-1})")
-            
-            # print(density_buffer.numpy())
-            # breakpoint()
-
-
-            # wp.Volume.save_to_nvdb(self.volume, "volume.nvdb")
-
-            # 使用 kernel 将粒子栅格化到体积网格
-            # wp.launch(
-            #     kernel=rasterize_particles_to_nvdb_volume,
-            #     dim=self.n,
-            #     inputs=[
-
-            #     ],
-            #     device="cuda:0"
-            # )
-
-            # wp.Volume.save_to_numpy(self.volume_density, "volume_density.npy")
-
             
             # 初始化或更新 MarchingCubes 上下文
             if self.mc is None:
@@ -509,23 +750,30 @@ class wcsph:
                 self.mc.domain_bounds_lower_corner = wp.vec3(self.world_min[0], self.world_min[1], self.world_min[2])
                 self.mc.domain_bounds_upper_corner = wp.vec3(self.world_max[0], self.world_max[1], self.world_max[2])
 
-            # 5. 使用 marching cubes 提取表面 mesh
-            # 将 volume_density 转换为 float32 类型（marching cubes 需要）
-            # volume_density_f32 = wp.array(
-            #     self.volume_density.numpy().astype(np.float32),
-            #     dtype=wp.float32,
-            #     device="cuda:0"
-            # )
-            # breakpoint()
-            
+            # 5. 对 volume density 做一次 3D 可分离高斯模糊，再 marching cubes
+            volume_smooth_iters = self.volume_smooth_iters
+            radius = self.volume_gaussian_radius
+            sigma = self.volume_gaussian_sigma
+            dim_vol = (self.volume_res_x, self.volume_res_y, self.volume_res_z)
+            density_smoothed = wp.zeros(dim_vol, dtype=float, device=self.device)
+            buf_a = wp.zeros(dim_vol, dtype=float, device=self.device)
+            buf_b = wp.zeros(dim_vol, dtype=float, device=self.device)
+            weights_np = _gaussian_1d_weights(radius, sigma)
+            weights_wp = wp.array(weights_np, dtype=float, device=self.device)
+            for _ in range(volume_smooth_iters):
+                src = density_buffer if _ == 0 else density_smoothed
+                wp.launch(kernel=smooth_volume_1d_x, dim=dim_vol, inputs=[src, buf_a, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
+                wp.launch(kernel=smooth_volume_1d_y, dim=dim_vol, inputs=[buf_a, buf_b, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
+                wp.launch(kernel=smooth_volume_1d_z, dim=dim_vol, inputs=[buf_b, density_smoothed, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
+            field_for_mc = density_smoothed if volume_smooth_iters > 0 else density_buffer
+
             self.mc.surface(
-                field=density_buffer,
+                field=field_for_mc,
                 threshold=self.volume_threshold
             )
             
-            # 6. 渲染 mesh（如果有顶点）
+            # 6. 渲染 mesh（volume 已平滑，无需再对顶点做拉普拉斯）
             if self.mc.verts is not None and self.mc.verts.shape[0] > 0:
-                # verts_np = self.mc.verts.numpy()
                 indices_np = self.mc.indices.numpy()
                 
                 if self.mc.verts.shape[0] > 0 and self.mc.indices.shape[0] > 0:
@@ -541,7 +789,6 @@ class wcsph:
                         points=verts_np,
                         indices=indices_np,
                         update_topology=True,
-
                     )
             
             # 可选：同时渲染粒子点（用于调试）
@@ -707,8 +954,12 @@ class wcsph:
         if fluid.IsValid():
             points = UsdGeom.Points(fluid)
             points_np = np.array(points.GetPointsAttr().Get())
+            # 复制一份并将 x 取反后拼接到原粒子
+            points_copy = np.array(points_np, copy=True)
+            points_copy[:, 0] = -points_copy[:, 0]
+            points_np = np.concatenate([points_np, points_copy], axis=0)
             self.particle_radius = points.GetWidthsAttr().Get()[0] * 0.5 * 100.0
-            self.x = wp.array(points_np, dtype=wp.vec3)
+            self.x = wp.array(points_np, dtype=wp.vec3, device=self.device)
             self.n = len(points_np)
             wp.launch(
                 kernel=to_micro_world, 
@@ -734,6 +985,10 @@ class wcsph:
 
 if __name__ == "__main__" :
     test = wcsph(True)
+    test.use_dfsph = False
+    test.preparation()
+    test.sub_step_num = 12
+    test.sim_dt = 0.005
     pt_array = test.x
     pt_nei_count = test.nei_count
     # print(pt_nei_count)
@@ -743,6 +998,7 @@ if __name__ == "__main__" :
     for i in range(6000) :
         with wp.ScopedTimer("frame", active=True):
             test.step()
+        # with wp.ScopedTimer("render", active=True):
             test.render()
             # test.render_test()
     # test.renderer.save()

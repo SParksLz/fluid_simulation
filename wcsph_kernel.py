@@ -366,46 +366,224 @@ def apply_bounds(
 
 # for dfsph
 @wp.kernel
-def compute_factor(
-        grid_id: wp.uint64,
-        x: wp.array(dtype=wp.vec3),
-        smoothing_length: float,
-        volume: float,
-        factor: wp.array(dtype=float),
-    ) :
+def compute_factor_dfsph(
+    grid_id: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    mass: wp.array(dtype=float),
+    smoothing_length: float,
+    factor: wp.array(dtype=float),
+):
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid_id, tid)
-    current_x = x[i]
+    xi = x[i]
+    sum_grad = wp.vec3(0.0, 0.0, 0.0)
+    sum_grad_sq = float(0.0)
+    neighbors = wp.hash_grid_query(grid_id, xi, smoothing_length)
+    for j in neighbors:
+        d = xi - x[j]
+        grad_w = get_cubic_derivative(d, smoothing_length)
+        mj = mass[j]
+        sum_grad += mj * grad_w
+        sum_grad_sq += wp.length(mj * grad_w) * wp.length(mj * grad_w)
+    denom = wp.length(sum_grad) * wp.length(sum_grad) + sum_grad_sq
+    if denom < 1e-6:
+        denom = 1e-6
+    factor[i] = 1.0 / denom
 
-    neighbors = wp.hash_grid_query(grid_id, current_x, smoothing_length)
 
-    grad_p_i = wp.vec3(0.0, 0.0, 0.0)
-    sum_grad_p_k = wp.float(0.0)
-    ret = wp.vec4(0.0, 0.0, 0.0, 0.0)  # 0-2 ：gradj 3: sum_grad_pressure_k 
+@wp.kernel
+def rho_dfsph(
+    particle_rho: wp.array(dtype=float),
+    particle_x: wp.array(dtype=wp.vec3),
+    rest_density: wp.array(dtype=float),
+    volume: float,
+    smoothing_length: float,
+    grid_id: wp.uint64,
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid_id, tid)
+    x = particle_x[i]
+    rho_temp = float(0.0)
+    neighbors = wp.hash_grid_query(grid_id, x, smoothing_length)
+    for index in neighbors:
+        rho_0_nei = rest_density[index]
+        distance = x - particle_x[index]
+        r_norm = wp.length(distance)
+        mass_nei = rho_0_nei * volume
+        rho_temp += mass_nei * get_cubic(r_norm, smoothing_length)
+    particle_rho[i] = rho_temp
 
 
-    for index in neighbors :
-        if index != i :
-            nei_x = x[index]
-            d = current_x - nei_x
-            
-            grad_j = -volume * get_cubic_derivative(d, smoothing_length)
-            ret.w += wp.length(grad_j) * wp.length(grad_j)
-            # ret.xyz -= grad_j
-            ret.x -= grad_j.x
-            ret.y -= grad_j.y
-            ret.z -= grad_j.z
-    sum_grad_p_k = ret.w
-    grad_p_i = wp.vec3(ret.x, ret.y, ret.z)
+@wp.kernel
+def compute_density_change_rate(
+    grid_id: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    mass: wp.array(dtype=float),
+    smoothing_length: float,
+    d_rho_dt: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid_id, tid)
+    xi = x[i]
+    vi = v[i]
+    div_val = float(0.0)
+    neighbors = wp.hash_grid_query(grid_id, xi, smoothing_length)
+    for j in neighbors:
+        d = xi - x[j]
+        grad_w = get_cubic_derivative(d, smoothing_length)
+        mj = mass[j]
+        div_val += mj * wp.dot(vi - v[j], grad_w)
+    d_rho_dt[i] = div_val
 
-    sum_grad_p_k += wp.length(grad_p_i) * wp.length(grad_p_i)
 
-    factor_temp = float(0.0)
-    if sum_grad_p_k > 1e-6:
-        factor_temp = -1.0 / sum_grad_p_k
-    else :
-        factor_temp = 0.0
-    factor[i] = factor_temp
+@wp.kernel
+def predict_density_star(
+    rho: wp.array(dtype=float),
+    d_rho_dt: wp.array(dtype=float),
+    dt: float,
+    rho_star: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    rho_star[tid] = rho[tid] + dt * d_rho_dt[tid]
+
+
+@wp.kernel
+def compute_kappa_density(
+    rho_star: wp.array(dtype=float),
+    rest_density: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    dt: float,
+    kappa: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    rho_err = rho_star[tid] - rest_density[tid]
+    if rho_err < 0.0:
+        rho_err = 0.0
+    kappa[tid] = (rho_err / (dt * dt)) * factor[tid]
+
+
+@wp.kernel
+def apply_constant_density_correction(
+    grid_id: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    v_star: wp.array(dtype=wp.vec3),
+    mass: wp.array(dtype=float),
+    rho: wp.array(dtype=float),
+    kappa: wp.array(dtype=float),
+    smoothing_length: float,
+    dt: float,
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid_id, tid)
+    xi = x[i]
+    dv = wp.vec3(0.0, 0.0, 0.0)
+    neighbors = wp.hash_grid_query(grid_id, xi, smoothing_length)
+    for j in neighbors:
+        d = xi - x[j]
+        grad_w = get_cubic_derivative(d, smoothing_length)
+        mj = mass[j]
+        coeff = mj * (kappa[i] / rho[i] + kappa[j] / rho[j])
+        dv += coeff * grad_w
+    v_star[i] -= dt * dv
+
+
+@wp.kernel
+def compute_kappa_divergence(
+    d_rho_dt: wp.array(dtype=float),
+    rho: wp.array(dtype=float),
+    factor: wp.array(dtype=float),
+    dt: float,
+    kappa_v: wp.array(dtype=float),
+):
+    tid = wp.tid()
+    kappa_v[tid] = (1.0 / dt) * d_rho_dt[tid] * rho[tid] * factor[tid]
+
+
+@wp.kernel
+def apply_divergence_free_correction(
+    grid_id: wp.uint64,
+    x: wp.array(dtype=wp.vec3),
+    v_star: wp.array(dtype=wp.vec3),
+    mass: wp.array(dtype=float),
+    rho: wp.array(dtype=float),
+    kappa_v: wp.array(dtype=float),
+    smoothing_length: float,
+    dt: float,
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid_id, tid)
+    xi = x[i]
+    dv = wp.vec3(0.0, 0.0, 0.0)
+    neighbors = wp.hash_grid_query(grid_id, xi, smoothing_length)
+    for j in neighbors:
+        d = xi - x[j]
+        grad_w = get_cubic_derivative(d, smoothing_length)
+        mj = mass[j]
+        coeff = mj * (kappa_v[i] / rho[i] + kappa_v[j] / rho[j])
+        dv += coeff * grad_w
+    v_star[i] -= dt * dv
+
+
+@wp.kernel
+def acceleration_non_pressure(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_v: wp.array(dtype=wp.vec3),
+    particle_rho_0: wp.array(dtype=float),
+    particle_rho: wp.array(dtype=float),
+    particle_a: wp.array(dtype=wp.vec3),
+    particle_size: float,
+    mass_: wp.array(dtype=float),
+    gamma_: wp.array(dtype=float),
+    mu_: wp.array(dtype=float),
+    gravity: float,
+    smoothing_length: float,
+    grid_id: wp.uint64,
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid_id, tid)
+    x = particle_x[i]
+    acc = wp.vec3(0.0, 0.0, 0.0)
+    neighbors = wp.hash_grid_query(grid_id, x, smoothing_length)
+    for index in neighbors:
+        if index != i:
+            nei_x = particle_x[index]
+            dir_current_nei = x - nei_x
+            distance = wp.length(dir_current_nei)
+            e_dist = wp.max(distance, particle_size)
+            rho_nei = particle_rho[index]
+            acc = cal_acc_with_non_pressure(
+                acc,
+                rho_nei,
+                particle_v[i], particle_v[index],
+                mass_[i], mass_[index],
+                mu_[i], gamma_[i],
+                dir_current_nei,
+                e_dist,
+                distance,
+                smoothing_length,
+            )
+    particle_a[i] = acc + wp.vec3(0.0, 0.0, gravity)
+
+
+@wp.kernel
+def predict_velocity(
+    v: wp.array(dtype=wp.vec3),
+    a: wp.array(dtype=wp.vec3),
+    dt: float,
+    v_star: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    v_star[tid] = v[tid] + dt * a[tid]
+
+
+@wp.kernel
+def copy_velocity(
+    v_star: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    v[tid] = v_star[tid]
 
 
 
@@ -565,6 +743,104 @@ def rasterize_particles_to_nvdb_volume(
                         # 使用原子操作累加到 density_buffer
                         wp.atomic_add(density_buffer, vx, vy, vz, density_contribution)
                         affected_count += 1
+@wp.kernel
+def smooth_volume_3d(
+    density_in: wp.array3d(dtype=float),
+    density_out: wp.array3d(dtype=float),
+    res_x: int,
+    res_y: int,
+    res_z: int,
+):
+    """3x3x3 盒式平滑：每个体素取 26 邻+自身的平均，volume 平滑后 marching cubes 的 mesh 更光滑。"""
+    i, j, k = wp.tid()
+    if i >= res_x or j >= res_y or k >= res_z:
+        return
+    total = float(0.0)
+    count = int(0)
+    for di in range(-1, 2):
+        for dj in range(-1, 2):
+            for dk in range(-1, 2):
+                ni = i + di
+                nj = j + dj
+                nk = k + dk
+                if ni >= 0 and ni < res_x and nj >= 0 and nj < res_y and nk >= 0 and nk < res_z:
+                    total += density_in[ni, nj, nk]
+                    count += 1
+    if count > 0:
+        density_out[i, j, k] = total / float(count)
+    else:
+        density_out[i, j, k] = density_in[i, j, k]
+
+
+@wp.kernel
+def smooth_volume_1d_x(
+    density_in: wp.array3d(dtype=float),
+    density_out: wp.array3d(dtype=float),
+    res_x: int,
+    res_y: int,
+    res_z: int,
+    weights: wp.array(dtype=float),
+    radius: int,
+):
+    """沿 X 方向的 1D 高斯模糊（可分离 3D Gaussian 的第一步）。"""
+    i, j, k = wp.tid()
+    if i >= res_x or j >= res_y or k >= res_z:
+        return
+    total = float(0.0)
+    r = int(radius)
+    for dx in range(-r, r + 1):
+        ii = i + dx
+        if ii >= 0 and ii < res_x:
+            total += density_in[ii, j, k] * weights[dx + r]
+    density_out[i, j, k] = total
+
+
+@wp.kernel
+def smooth_volume_1d_y(
+    density_in: wp.array3d(dtype=float),
+    density_out: wp.array3d(dtype=float),
+    res_x: int,
+    res_y: int,
+    res_z: int,
+    weights: wp.array(dtype=float),
+    radius: int,
+):
+    """沿 Y 方向的 1D 高斯模糊。"""
+    i, j, k = wp.tid()
+    if i >= res_x or j >= res_y or k >= res_z:
+        return
+    total = float(0.0)
+    r = int(radius)
+    for dy in range(-r, r + 1):
+        jj = j + dy
+        if jj >= 0 and jj < res_y:
+            total += density_in[i, jj, k] * weights[dy + r]
+    density_out[i, j, k] = total
+
+
+@wp.kernel
+def smooth_volume_1d_z(
+    density_in: wp.array3d(dtype=float),
+    density_out: wp.array3d(dtype=float),
+    res_x: int,
+    res_y: int,
+    res_z: int,
+    weights: wp.array(dtype=float),
+    radius: int,
+):
+    """沿 Z 方向的 1D 高斯模糊。"""
+    i, j, k = wp.tid()
+    if i >= res_x or j >= res_y or k >= res_z:
+        return
+    total = float(0.0)
+    r = int(radius)
+    for dz in range(-r, r + 1):
+        kk = k + dz
+        if kk >= 0 and kk < res_z:
+            total += density_in[i, j, kk] * weights[dz + r]
+    density_out[i, j, k] = total
+
+
 @wp.kernel
 def copy_density_to_volume(
     density_buffer: wp.array3d(dtype=float),
