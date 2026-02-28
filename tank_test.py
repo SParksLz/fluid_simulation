@@ -1,6 +1,7 @@
 import numpy as np
 import warp as wp
-import warp.render
+# import warp.render
+from renderer.render_opengl import CustomOpenGLRenderer
 import json
 from wcsph_kernel import *
 import math
@@ -285,7 +286,7 @@ class wcsph:
 
         self.sph_model.build_hash_grid()
 
-        self.renderer = wp.render.OpenGLRenderer(
+        self.renderer = CustomOpenGLRenderer(
             up_axis="Z",
             camera_pos=self.camera_pos,
             near_plane=0.001,
