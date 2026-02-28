@@ -9,6 +9,17 @@ from pathlib import Path
 from collections import defaultdict
 
 
+@wp.kernel
+def velocity_visualize(
+    v: wp.array(dtype = wp.vec3),
+    color: wp.array(dtype = wp.vec3),
+):
+    tid = wp.tid()
+    v_length = wp.length(v[tid])
+    color[tid] = wp.lerp(wp.vec3(0.1, 0.5, 1.0), wp.vec3(1.0, 1.0, 1.0), v_length * 0.05)
+
+    
+
 def _gaussian_1d_weights(radius: int, sigma: float) -> np.ndarray:
     """1D 高斯核权重，长度 2*radius+1，已归一化。"""
     n = 2 * radius + 1
@@ -159,7 +170,7 @@ class wcsph:
         # fluid material
         self.sph_model.liquid_material.tension = 0.5
         self.sph_model.liquid_material.stiffness = 85000.0
-        self.sph_model.liquid_material.mu = 3.0
+        self.sph_model.liquid_material.mu = 1.2
 
         self.p_volume = 0.8 * (self.particle_distance ** 3)
         self.sub_step_num = 4
@@ -237,6 +248,7 @@ class wcsph:
         self.rho_0 = wp.full(self.n, self.sph_model.liquid_material.rho, device=dev)
 
         self.v = wp.zeros(self.n, dtype=wp.vec3, device=dev)
+        # self.colors = wp.zeros(self.n, dtype=wp.vec3, device=dev)
         self.rho = wp.zeros(self.n, dtype=float, device=dev)
         self.a = wp.zeros(self.n, dtype=wp.vec3, device=dev)
         self.nei_count = wp.zeros(self.n, dtype=wp.int32, device=dev)
@@ -778,26 +790,40 @@ class wcsph:
                 
                 if self.mc.verts.shape[0] > 0 and self.mc.indices.shape[0] > 0:
                     real_verts = wp.empty(self.mc.verts.shape[0], dtype=wp.vec3)
+                    test_color = wp.full(self.mc.verts.shape[0], wp.vec3(1.0, 0.0, 0.0), device=self.device)
+                    colors = wp.empty(self.mc.verts.shape[0], dtype=wp.vec3)
                     wp.launch(
                             kernel=to_real_world,
                             dim=self.mc.verts.shape[0],
                             inputs=[self.mc.verts, real_verts, 0.01, wp.vec3(0.0, 0.0, 0.0)]
                         )
+                    # wp.launch(
+                    #     kernel=color_test,
+                    #     dim=self.mc.verts.shape[0],
+                    #     inputs=[self.mc.verts, colors]
+                    # )
                     verts_np = real_verts.numpy()
-                    self.renderer.render_mesh(
-                        name="fluid_mesh",
-                        points=verts_np,
-                        indices=indices_np,
-                        update_topology=True,
-                    )
+                    # color_np = test_color.numpy()
+                    # self.renderer.render_mesh(
+                    #     name="fluid_mesh",
+                    #     points=verts_np,
+                    #     indices=indices_np,
+                    #     update_topology=True,
+                    #     # colors=color_np,
+                    # )
             
             # 可选：同时渲染粒子点（用于调试）
-            # self.renderer.render_points(
-            #     points=self.render_x.numpy(), 
-            #     radius=self.particle_radius * 0.01, 
-            #     name="points", 
-            #     colors=(0.2, 0.3, 0.7)
-            # )
+            wp.launch(
+                kernel=velocity_visualize,
+                dim=self.n,
+                inputs=[self.v, self.colors]
+            )
+            self.renderer.render_points(
+                points=self.render_x.numpy(), 
+                radius=self.particle_radius * 0.01, 
+                name="points", 
+                colors=self.colors.numpy()
+            )
 
             # grid_pts = wp.array(self.get_voxel_positions(), dtype=wp.vec3)
             # debug_grid = wp.empty(grid_pts.shape[0], dtype=wp.vec3)
@@ -956,10 +982,16 @@ class wcsph:
             points_np = np.array(points.GetPointsAttr().Get())
             # 复制一份并将 x 取反后拼接到原粒子
             points_copy = np.array(points_np, copy=True)
-            points_copy[:, 0] = -points_copy[:, 0]
+            points_copy[:, 0] = points_copy[:, 0] + 0.5
+
+            blue_color = np.full((len(points_copy), 3), (0.0, 0.0, 1.0))
+            yellow_color = np.full((len(points_copy), 3), (1.0, 1.0, 0.0))
+
             points_np = np.concatenate([points_np, points_copy], axis=0)
+            colors_np = np.concatenate([blue_color, yellow_color], axis=0)
             self.particle_radius = points.GetWidthsAttr().Get()[0] * 0.5 * 100.0
             self.x = wp.array(points_np, dtype=wp.vec3, device=self.device)
+            self.colors = wp.array(colors_np, dtype=wp.vec3, device=self.device)
             self.n = len(points_np)
             wp.launch(
                 kernel=to_micro_world, 
