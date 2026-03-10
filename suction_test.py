@@ -124,6 +124,8 @@ class wcsph:
         self.rho = wp.zeros(self.n, dtype=float)
         self.a = wp.zeros(self.n, dtype=wp.vec3)
         self.nei_count = wp.zeros(self.n, dtype=wp.int32)
+        self.bound_touched = wp.zeros(self.n, dtype=wp.int32)
+        self.bound_penetration = wp.zeros(self.n, dtype=float)
         self.pressure = wp.zeros(self.n, dtype=float)
         self.factor = wp.zeros(self.n, dtype=float)
 
@@ -285,25 +287,29 @@ class wcsph:
         # # drift
         wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v, self.sim_dt])
         # # ground collision
-        wp.launch(kernel=apply_bounds, dim=self.n, inputs=[self.x, self.v ,self.bound_3d_size ,-0.1])
-        wp.launch(
-            kernel=update_collider_with_tri_mesh, 
-            dim=self.n, 
-            inputs=[
-                self.x, 
-                self.v, 
-                self.collider.id, 
-                self.particle_radius, 
-                1.0, 0.1],
-        )
+        # wp.launch(
+        #     kernel=apply_bounds,
+        #     dim=self.n,
+        #     inputs=[self.x, self.v, self.bound_3d_size, -0.1, self.bound_touched, self.bound_penetration],
+        # )
+        # wp.launch(
+        #     kernel=update_collider_with_tri_mesh, 
+        #     dim=self.n, 
+        #     inputs=[
+        #         self.x, 
+        #         self.v, 
+        #         self.collider.id, 
+        #         self.particle_radius, 
+        #         1.0, 0.1],
+        # )
         wp.launch(
             kernel=to_real_world,
             dim=self.n,
             inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)])
-        wp.launch(
-            kernel=to_real_world,
-            dim=self.combine_vtx.shape[0],
-            inputs=[self.combine_vtx, self.collider_render_vtx, 0.01, wp.vec3(0.0, 0.0, 0.0)])
+        # wp.launch(
+        #     kernel=to_real_world,
+        #     dim=self.combine_vtx.shape[0],
+        #     inputs=[self.combine_vtx, self.collider_render_vtx, 0.01, wp.vec3(0.0, 0.0, 0.0)])
 
     # def preparation(self) :
     #     with wp.ScopedTimer("preparation", active=True):

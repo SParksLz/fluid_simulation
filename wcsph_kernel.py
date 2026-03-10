@@ -324,44 +324,68 @@ def apply_bounds(
     particle_v: wp.array(dtype=wp.vec3),
     size: wp.vec3,
     damping_coef: float,
+    bound_touched: wp.array(dtype=wp.int32),
+    bound_penetration: wp.array(dtype=float),
 ):
     tid = wp.tid()
 
     # get pos and velocity
     x = particle_x[tid]
     v = particle_v[tid]
+    touched = wp.int32(0)
+    max_penetration = 0.0
 
 
     if x[0] < -size.x:
+        max_penetration = wp.max(max_penetration, -size.x - x[0])
+        touched = 1
         x = wp.vec3(-size.x, x[1], x[2])
-        v = wp.vec3(v[0] * damping_coef, v[1], v[2])
+        if v[0] < 0.0:
+            v = wp.vec3(v[0] * damping_coef, v[1], v[2])
 
     # clamp x right
     if x[0] > size.x:
+        max_penetration = wp.max(max_penetration, x[0] - size.x)
+        touched = 1
         x = wp.vec3(size.x, x[1], x[2])
-        v = wp.vec3(v[0] * damping_coef, v[1], v[2])
+        if v[0] > 0.0:
+            v = wp.vec3(v[0] * damping_coef, v[1], v[2])
 
     if x[1] > size.y :
+        max_penetration = wp.max(max_penetration, x[1] - size.y)
+        touched = 1
         x = wp.vec3(x[0], size.y, x[2])
-        v = wp.vec3(v[0], v[1] *damping_coef, v[2])
+        if v[1] > 0.0:
+            v = wp.vec3(v[0], v[1] * damping_coef, v[2])
     # clamp y bot
     if x[1] < -size.y:
+        max_penetration = wp.max(max_penetration, -size.y - x[1])
+        touched = 1
         x = wp.vec3(x[0], -size.y, x[2])
-        v = wp.vec3(v[0], v[1] * damping_coef, v[2])
+        if v[1] < 0.0:
+            v = wp.vec3(v[0], v[1] * damping_coef, v[2])
 
     # clamp z left
     if x[2] < 0.0:
+        max_penetration = wp.max(max_penetration, -x[2])
+        touched = 1
         x = wp.vec3(x[0], x[1], 0.0)
-        v = wp.vec3(v[0], v[1], v[2] * damping_coef)
+        if v[2] < 0.0:
+            v = wp.vec3(v[0], v[1], v[2] * damping_coef)
 
     # clamp z right
     if x[2] > size.z * 2.0:
+        max_penetration = wp.max(max_penetration, x[2] - size.z * 2.0)
+        touched = 1
         x = wp.vec3(x[0], x[1], size.z * 2.0)
-        v = wp.vec3(v[0], v[1], v[2] * damping_coef)
+        if v[2] > 0.0:
+            v = wp.vec3(v[0], v[1], v[2] * damping_coef)
 
     # apply clamps
     particle_x[tid] = x
     particle_v[tid] = v
+    bound_touched[tid] = touched
+    bound_penetration[tid] = max_penetration
 
 
 # for dfsph
@@ -371,23 +395,32 @@ def compute_factor_dfsph(
     x: wp.array(dtype=wp.vec3),
     mass: wp.array(dtype=float),
     smoothing_length: float,
-    factor: wp.array(dtype=float),
+    factor: wp.array(dtype=float),   # factor = 1 / denom
 ):
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid_id, tid)
     xi = x[i]
+
     sum_grad = wp.vec3(0.0, 0.0, 0.0)
     sum_grad_sq = float(0.0)
+
     neighbors = wp.hash_grid_query(grid_id, xi, smoothing_length)
     for j in neighbors:
+        if j == i:
+            continue
+
         d = xi - x[j]
         grad_w = get_cubic_derivative(d, smoothing_length)
         mj = mass[j]
-        sum_grad += mj * grad_w
-        sum_grad_sq += wp.length(mj * grad_w) * wp.length(mj * grad_w)
-    denom = wp.length(sum_grad) * wp.length(sum_grad) + sum_grad_sq
-    if denom < 1e-6:
-        denom = 1e-6
+
+        g = mj * grad_w
+        sum_grad += g
+        sum_grad_sq += wp.dot(g, g)
+
+    denom = wp.dot(sum_grad, sum_grad) + sum_grad_sq
+    if denom < 1.0e-6:
+        denom = 1.0e-6
+
     factor[i] = 1.0 / denom
 
 
@@ -452,14 +485,17 @@ def predict_density_star(
 def compute_kappa_density(
     rho_star: wp.array(dtype=float),
     rest_density: wp.array(dtype=float),
-    factor: wp.array(dtype=float),
+    factor: wp.array(dtype=float),   # factor = 1 / denom
     dt: float,
     kappa: wp.array(dtype=float),
 ):
     tid = wp.tid()
+
     rho_err = rho_star[tid] - rest_density[tid]
     if rho_err < 0.0:
         rho_err = 0.0
+
+    # Store kappa as p/rho form used by apply_constant_density_correction.
     kappa[tid] = (rho_err / (dt * dt)) * factor[tid]
 
 
@@ -487,18 +523,17 @@ def apply_constant_density_correction(
         dv += coeff * grad_w
     v_star[i] -= dt * dv
 
-
 @wp.kernel
 def compute_kappa_divergence(
     d_rho_dt: wp.array(dtype=float),
     rho: wp.array(dtype=float),
-    factor: wp.array(dtype=float),
+    factor: wp.array(dtype=float),   # factor = 1 / denom
     dt: float,
     kappa_v: wp.array(dtype=float),
 ):
     tid = wp.tid()
-    kappa_v[tid] = (1.0 / dt) * d_rho_dt[tid] * rho[tid] * factor[tid]
 
+    kappa_v[tid] = (1.0 / dt) * d_rho_dt[tid] * rho[tid] * factor[tid]
 
 @wp.kernel
 def apply_divergence_free_correction(

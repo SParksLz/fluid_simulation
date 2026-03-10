@@ -5,10 +5,11 @@ from renderer.render_opengl import CustomOpenGLRenderer
 import json
 from wcsph_kernel import *
 import math
+import time
 from pxr import Usd, UsdGeom, Vt, Sdf
 from pathlib import Path
 from collections import defaultdict
-
+from pprint import pprint
 
 @wp.kernel
 def velocity_visualize(
@@ -110,8 +111,8 @@ class sph_material:
                 rho = 1000.0, # rest density
                 stiffness = 50000.0,
                 exponent = 7.0, 
-                mu=0.005,
-                tension=0.01) -> None:
+                mu=0.1,
+                tension=0.1) -> None:
         self.rho = rho
         self.stiffness = stiffness
         self.exponent = exponent
@@ -133,6 +134,7 @@ class sph_model :
 
     def build_hash_grid(self):
         grid_cell_size = int(self.bound_height / self.particle_distance)
+        self.grid_cell_size = grid_cell_size
 
         self.grid = wp.HashGrid(grid_cell_size, grid_cell_size, grid_cell_size)
         # self.grid.build(particle_q, self.smoothing_length)
@@ -140,6 +142,22 @@ class sph_model :
 class wcsph:
     def __init__(self, load_from_usd=False) -> None:
         self.verbose = False
+        # When True, timer blocks include GPU synchronization for accurate per-kernel timing.
+        self.sync_timers = False
+        # Neighbor counting is only for diagnostics and is expensive; keep it off in main simulation path.
+        self.enable_neighbor_count = False
+        # Optional deep diagnostics (copies arrays back to CPU), keep off during normal runs.
+        self.profile_substep_stats = False
+        self.profile_substep_interval = 1
+        # Per-iteration DFSPH diagnostics: prints density error/divergence trend every solver iteration.
+        self.log_dfsph_iteration_metrics = True
+        # Per-substep summary diagnostics requested during DFSPH tuning.
+        self.log_substep_metrics = True
+        self.substep_metrics_log_enabled = True
+        self.substep_metrics_log_path = Path(__file__).parent / "temp" / "dfsph_substep_metrics.csv"
+        self.log_adaptive_dt = True
+        self._substep_counter = 0
+        self._timing_mode_notified = False
         self.load_from_usd = load_from_usd
         self.sim_time = 0.0
         self.sim_dt = 1.0 / 60.0
@@ -169,9 +187,9 @@ class wcsph:
         self.sph_model = sph_model(self.bound_size, self.smoothing_length)
 
         # fluid material
-        self.sph_model.liquid_material.tension = 0.5
+        self.sph_model.liquid_material.tension = 0.02
         self.sph_model.liquid_material.stiffness = 85000.0
-        self.sph_model.liquid_material.mu = 1.2
+        self.sph_model.liquid_material.mu = 0.05
 
         self.p_volume = 0.8 * (self.particle_distance ** 3)
         self.sub_step_num = 4
@@ -236,6 +254,9 @@ class wcsph:
         self.volume_smooth_iters = 1  # 对 density volume 做 3D 可分离高斯模糊的遍数（每遍 = x+y+z 三向）
         self.volume_gaussian_radius = 1  # 1D 高斯核半径（半宽），核长 2*radius+1
         self.volume_gaussian_sigma = 1.0  # 1D 高斯 sigma
+        self.enable_volume_mesh = False
+        self.volume_mesh_update_interval = 6
+        self._frame_index = 0
 
 
 
@@ -253,6 +274,8 @@ class wcsph:
         self.rho = wp.zeros(self.n, dtype=float, device=dev)
         self.a = wp.zeros(self.n, dtype=wp.vec3, device=dev)
         self.nei_count = wp.zeros(self.n, dtype=wp.int32, device=dev)
+        self.bound_touched = wp.zeros(self.n, dtype=wp.int32, device=dev)
+        self.bound_penetration = wp.zeros(self.n, dtype=float, device=dev)
         self.pressure = wp.zeros(self.n, dtype=float, device=dev)
         self.factor = wp.zeros(self.n, dtype=float, device=dev)
 
@@ -263,10 +286,12 @@ class wcsph:
         self.kappa = wp.zeros(self.n, dtype=float, device=dev)
         self.dfsph_eta_density = 1e-4 * self.sph_model.liquid_material.rho
         self.dfsph_eta_divergence = 1e-4
-        self.dfsph_max_iters_density = 20
-        self.dfsph_max_iters_divergence = 10
+        self.dfsph_max_iters_density = 2
+        self.dfsph_max_iters_divergence = 1
 
         self.render_x = wp.empty(self.n, dtype=wp.vec3, device=dev)
+        if not hasattr(self, "colors"):
+            self.colors = wp.full(self.n, wp.vec3(0.2, 0.3, 0.7), device=dev)
 
         # set random positions
         # wp.launch(
@@ -285,6 +310,10 @@ class wcsph:
         # self.save_particle_to_json()
 
         self.sph_model.build_hash_grid()
+        print(
+            f"hash grid: {self.sph_model.grid_cell_size}^3, smoothing_length={self.smoothing_length:.6f}, "
+            f"neighbor_count_kernel={'on' if self.enable_neighbor_count else 'off'}"
+        )
 
         self.renderer = CustomOpenGLRenderer(
             up_axis="Z",
@@ -301,46 +330,207 @@ class wcsph:
         # )
 
         # self.preparation()
-    def compute_sim_dt(
-            self,
-            dt_min, 
-            dt_max, 
-        ) :
+        self._init_substep_metrics_log()
 
-        eps = 1e-12
-        a_max = max(np.linalg.norm(a_i) for a_i in self.a.numpy())
+    def compute_sim_dt(self):
+        # Estimate stable substep dt, then convert to frame dt using sub_step_num.
+        wp.synchronize_device(self.device)
+        a_np = self.a.numpy()
+        a_norm = np.linalg.norm(a_np, axis=1)
+        a_max = float(np.max(a_norm))
+        if not np.isfinite(a_max):
+            a_max = 0.0
 
-        c_s= math.sqrt((self.sph_model.liquid_material.stiffness / self.sph_model.liquid_material.rho))
+        eps = 1.0e-12
+        c_s = math.sqrt(self.sph_model.liquid_material.stiffness / self.sph_model.liquid_material.rho)
 
-        dt_force = 0.25 * self.smoothing_length / (a_max + eps)
-        dt_sound = 0.4 * self.smoothing_length / (c_s * 1.05 + eps)
-        dt = min(dt_force, dt_sound)
-        dt = max(dt_min, min(dt_max, dt))
-        dt = min(dt, self.sim_dt * 1.1)
-        self.sim_dt = dt
-        print(self.sim_dt)
+        # CFL-like criteria on substep dt.
+        sub_dt_force = 0.25 * math.sqrt(self.smoothing_length / (a_max + eps))
+        sub_dt_sound = 0.4 * self.smoothing_length / (c_s * 1.05 + eps)
+        sub_dt_target = min(sub_dt_force, sub_dt_sound)
+        frame_dt_target = sub_dt_target * float(max(self.sub_step_num, 1))
 
+        prev_dt = float(self.sim_dt)
+        dt_min = prev_dt * 0.5
+        dt_max = prev_dt * 1.1
+        new_dt = max(dt_min, min(dt_max, frame_dt_target))
+        self.sim_dt = new_dt
+
+        if self.log_adaptive_dt:
+            pprint(
+                "adaptive dt: "
+                f"prev={prev_dt:.6e}, new={new_dt:.6e}, "
+                f"sub_target={sub_dt_target:.6e}, "
+                f"sub_force={sub_dt_force:.6e}, sub_sound={sub_dt_sound:.6e}, "
+                f"a_max={a_max:.6e}, c_s={c_s:.6e}"
+            )
+
+
+    def _sync_for_timing(self, dev: str | None = None):
+        if self.sync_timers:
+            wp.synchronize_device(dev or self.device)
+
+    def _init_substep_metrics_log(self):
+        if not self.substep_metrics_log_enabled:
+            return
+        self.substep_metrics_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.substep_metrics_log_path.open("w", encoding="utf-8") as f:
+            f.write(
+                "substep,max_abs_drho_dt,max_rho_ratio_err,apply_bounds_count,max_penetration\n"
+            )
+
+    def _append_substep_metrics_log(
+        self,
+        max_abs_drho_dt: float,
+        max_density_ratio_err: float,
+        apply_bounds_count: int,
+        max_penetration: float,
+    ):
+        if not self.substep_metrics_log_enabled:
+            return
+        with self.substep_metrics_log_path.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{self._substep_counter},{max_abs_drho_dt:.10e},{max_density_ratio_err:.10e},"
+                f"{apply_bounds_count},{max_penetration:.10e}\n"
+            )
+
+    def _timed_kernel(self, name: str, kernel, dim, inputs, device: str):
+        if not self.verbose:
+            wp.launch(kernel=kernel, dim=dim, inputs=inputs, device=device)
+            return
+        if self.sync_timers:
+            self._sync_for_timing(device)
+            t0 = time.perf_counter()
+            wp.launch(kernel=kernel, dim=dim, inputs=inputs, device=device)
+            self._sync_for_timing(device)
+            print(f"        {name} took {(time.perf_counter() - t0) * 1000.0:.2f} ms")
+        else:
+            with wp.ScopedTimer(name, active=True):
+                wp.launch(kernel=kernel, dim=dim, inputs=inputs, device=device)
+
+    def _timed_block(self, name: str, fn, device: str):
+        if not self.verbose:
+            fn()
+            return
+        if self.sync_timers:
+            self._sync_for_timing(device)
+            t0 = time.perf_counter()
+            fn()
+            self._sync_for_timing(device)
+            print(f"        {name} took {(time.perf_counter() - t0) * 1000.0:.2f} ms")
+        else:
+            with wp.ScopedTimer(name, active=True):
+                fn()
+
+    def _apply_bounds_with_stats(self, velocity_array, bounds_stats: dict, device: str):
+        wp.launch(
+            kernel=apply_bounds,
+            dim=self.n,
+            inputs=[
+                self.x,
+                velocity_array,
+                self.bound_3d_size,
+                -0.1,
+                self.bound_touched,
+                self.bound_penetration,
+            ],
+            device=device,
+        )
+        if not self.log_substep_metrics:
+            return
+        self._sync_for_timing(device)
+        touched_np = self.bound_touched.numpy()
+        penetration_np = self.bound_penetration.numpy()
+        touched_mask = touched_np != 0
+        if bounds_stats["touched_mask"] is None:
+            bounds_stats["touched_mask"] = touched_mask
+        else:
+            bounds_stats["touched_mask"] |= touched_mask
+        bounds_stats["max_penetration"] = max(
+            bounds_stats["max_penetration"],
+            float(np.max(penetration_np)),
+        )
+
+    def _print_substep_metrics(self, bounds_stats: dict, device: str):
+        if not self.log_substep_metrics:
+            return
+        self.sph_model.grid.build(self.x, self.smoothing_length)
+        wp.launch(
+            kernel=compute_density_change_rate,
+            dim=self.n,
+            inputs=[
+                self.sph_model.grid.id,
+                self.x,
+                self.v,
+                self.mass,
+                self.smoothing_length,
+                self.d_rho_dt,
+            ],
+            device=device,
+        )
+        wp.launch(
+            kernel=rho_dfsph,
+            dim=self.n,
+            inputs=[
+                self.rho,
+                self.x,
+                self.rho_0,
+                self.p_volume,
+                self.smoothing_length,
+                self.sph_model.grid.id,
+            ],
+            device=device,
+        )
+        self._sync_for_timing(device)
+        d_rho_dt_np = self.d_rho_dt.numpy()
+        rho_np = self.rho.numpy()
+        rho0_np = self.rho_0.numpy()
+        max_abs_drho_dt = float(np.max(np.abs(d_rho_dt_np)))
+        max_density_ratio_err = float(np.max(rho_np / np.maximum(rho0_np, 1.0e-12) - 1.0))
+        bounds_count = (
+            0
+            if bounds_stats["touched_mask"] is None
+            else int(np.count_nonzero(bounds_stats["touched_mask"]))
+        )
+        print(
+            "        substep metrics: "
+            f"max_abs_drho_dt={max_abs_drho_dt:.6e}, "
+            f"max(rho/rho0-1)={max_density_ratio_err:.6e}, "
+            f"apply_bounds_count={bounds_count}, "
+            f"max_penetration={bounds_stats['max_penetration']:.6e}"
+        )
+        self._append_substep_metrics_log(
+            max_abs_drho_dt=max_abs_drho_dt,
+            max_density_ratio_err=max_density_ratio_err,
+            apply_bounds_count=bounds_count,
+            max_penetration=bounds_stats["max_penetration"],
+        )
 
 
 
     
 
-    def sub_step(self) :
-        # self.compute_sim_dt(self.sim_dt * 0.9, self.sim_dt * 1.1)
+    def sub_step(self, dt: float | None = None) :
+        if dt is None:
+            dt = float(self.sim_dt) / float(max(self.sub_step_num, 1))
+        else:
+            dt = float(dt)
+        bounds_stats = {"touched_mask": None, "max_penetration": 0.0}
         def _wcsph_substep() :
             with wp.ScopedTimer("grid build", active=False):
                         # build grid
                 self.sph_model.grid.build(self.x, self.smoothing_length)
-                wp.launch(
-                    kernel=get_neighbor,
-                    dim=self.n,
-                    inputs=[
-                        self.sph_model.grid.id,
-                        self.x,
-                        self.smoothing_length,
-                        self.nei_count,
-                    ]
-                )
+                if self.enable_neighbor_count:
+                    wp.launch(
+                        kernel=get_neighbor,
+                        dim=self.n,
+                        inputs=[
+                            self.sph_model.grid.id,
+                            self.x,
+                            self.smoothing_length,
+                            self.nei_count,
+                        ]
+                    )
             with wp.ScopedTimer("calculate density", active = self.verbose) :
 
                 wp.launch(
@@ -382,12 +572,12 @@ class wcsph:
                     ]
                 )
             # # kick
-            wp.launch(kernel=kick, dim=self.n, inputs=[self.v, self.a, self.sim_dt])
+            wp.launch(kernel=kick, dim=self.n, inputs=[self.v, self.a, dt])
 
             # # drift
-            wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v, self.sim_dt])
+            wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v, dt])
             # # ground collision
-            wp.launch(kernel=apply_bounds, dim=self.n, inputs=[self.x, self.v ,self.bound_3d_size ,-0.1])
+            self._apply_bounds_with_stats(self.v, bounds_stats, self.device)
             # wp.launch(
             #     kernel=update_collider_with_tri_mesh, 
             #     dim=self.n, 
@@ -404,22 +594,22 @@ class wcsph:
                 inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)])
         def _dfsph_substep():
             dev = self.device
-            dt = float(self.sim_dt)
-            print(dt)
             # 1) 邻居
-            with wp.ScopedTimer("grid build", active=False):
+            def _build_grid_phase_1():
                 self.sph_model.grid.build(self.x, self.smoothing_length)
-                wp.launch(
-                    kernel=get_neighbor,
-                    dim=self.n,
-                    inputs=[
-                        self.sph_model.grid.id,
-                        self.x,
-                        self.smoothing_length,
-                        self.nei_count,
-                    ],
-                    device=dev,
-                )
+                if self.enable_neighbor_count:
+                    wp.launch(
+                        kernel=get_neighbor,
+                        dim=self.n,
+                        inputs=[
+                            self.sph_model.grid.id,
+                            self.x,
+                            self.smoothing_length,
+                            self.nei_count,
+                        ],
+                        device=dev,
+                    )
+            self._timed_block("grid build", _build_grid_phase_1, dev)
             # 2) 密度 ρ 与因子 α（论文 Algorithm 1：每步开始时的 ρ、α）
             with wp.ScopedTimer("density and factor", active=self.verbose):
                 wp.launch(
@@ -447,6 +637,7 @@ class wcsph:
                     ],
                     device=dev,
                 )
+                self._sync_for_timing(dev)
             # 3) 非压力力 F_adv，预测速度 v* = v + Δt F_adv/m
             with wp.ScopedTimer("non-pressure forces", active=self.verbose):
                 wp.launch(
@@ -468,66 +659,106 @@ class wcsph:
                     ],
                     device=dev,
                 )
-            wp.launch(
+                self._sync_for_timing(dev)
+            self._timed_kernel(
+                name="predict_velocity",
                 kernel=predict_velocity,
                 dim=self.n,
                 inputs=[self.v, self.a, dt, self.v_star],
                 device=dev,
             )
             # 4) 常数密度修正 (Algorithm 3)：至少 2 次迭代
-            for _ in range(self.dfsph_max_iters_density):
-                wp.launch(
-                    kernel=compute_density_change_rate,
-                    dim=self.n,
-                    inputs=[
-                        self.sph_model.grid.id,
-                        self.x,
-                        self.v_star,
-                        self.mass,
-                        self.smoothing_length,
-                        self.d_rho_dt,
-                    ],
-                    device=dev,
-                )
-                wp.launch(
-                    kernel=predict_density_star,
-                    dim=self.n,
-                    inputs=[self.rho, self.d_rho_dt, dt, self.rho_star],
-                    device=dev,
-                )
-                wp.launch(
-                    kernel=compute_kappa_density,
-                    dim=self.n,
-                    inputs=[
-                        self.rho_star,
-                        self.rho_0,
-                        self.factor,
-                        dt,
-                        self.kappa,
-                    ],
-                    device=dev,
-                )
-                wp.launch(
-                    kernel=apply_constant_density_correction,
-                    dim=self.n,
-                    inputs=[
-                        self.sph_model.grid.id,
-                        self.x,
-                        self.v_star,
-                        self.mass,
-                        self.rho,
-                        self.rho_0,
-                        self.kappa,
-                        self.smoothing_length,
-                        dt,
-                    ],
-                    device=dev,
-                )
+            with wp.ScopedTimer("density correct iteration", active=self.verbose):
+                self._sync_for_timing(dev)
+                rho0_np = None
+                prev_density_err_max = None
+                prev_density_div_max = None
+                if self.log_dfsph_iteration_metrics:
+                    rho0_np = self.rho_0.numpy()
+                for it in range(self.dfsph_max_iters_density):
+                    self._timed_kernel(
+                        name="compute_density_change_rate",
+                        kernel=compute_density_change_rate,
+                        dim=self.n,
+                        inputs=[
+                            self.sph_model.grid.id,
+                            self.x,
+                            self.v_star,
+                            self.mass,
+                            self.smoothing_length,
+                            self.d_rho_dt,
+                        ],
+                        device=dev,
+                    )
+                    self._timed_kernel(
+                        name="predict_density_star",
+                        kernel=predict_density_star,
+                        dim=self.n,
+                        inputs=[self.rho, self.d_rho_dt, dt, self.rho_star],
+                        device=dev,
+                    )
+                    if self.log_dfsph_iteration_metrics:
+                        rho_star_np = self.rho_star.numpy()
+                        d_rho_dt_np = self.d_rho_dt.numpy()
+                        rho_err_np = np.maximum(rho_star_np - rho0_np, 0.0)
+                        rho_err_max = float(np.max(rho_err_np))
+                        rho_err_mean = float(np.mean(rho_err_np))
+                        div_abs_np = np.abs(d_rho_dt_np)
+                        div_max = float(np.max(div_abs_np))
+                        div_mean = float(np.mean(div_abs_np))
+                        if prev_density_err_max is None:
+                            rho_trend = "n/a"
+                        else:
+                            rho_trend = "down" if rho_err_max <= prev_density_err_max else "up"
+                        if prev_density_div_max is None:
+                            div_trend = "n/a"
+                        else:
+                            div_trend = "down" if div_max <= prev_density_div_max else "up"
+                        print(
+                            f"        [density iter {it + 1}/{self.dfsph_max_iters_density}] "
+                            f"rho_err(max/mean)=({rho_err_max:.6e}/{rho_err_mean:.6e}) [{rho_trend}] "
+                            f"| |drho_dt|(max/mean)=({div_max:.6e}/{div_mean:.6e}) [{div_trend}]"
+                        )
+                        prev_density_err_max = rho_err_max
+                        prev_density_div_max = div_max
+                    self._timed_kernel(
+                        name="compute_kappa_density",
+                        kernel=compute_kappa_density,
+                        dim=self.n,
+                        inputs=[
+                            self.rho_star,
+                            self.rho_0,
+                            self.factor,
+                            dt,
+                            self.kappa,
+                        ],
+                        device=dev,
+                    )
+                    self._timed_kernel(
+                        name="apply_constant_density_correction",
+                        kernel=apply_constant_density_correction,
+                        dim=self.n,
+                        inputs=[
+                            self.sph_model.grid.id,
+                            self.x,
+                            self.v_star,
+                            self.mass,
+                            self.rho,
+                            self.kappa,
+                            self.smoothing_length,
+                            dt,
+                        ],
+                        device=dev,
+                    )
+                self._sync_for_timing(dev)
             # 5) 更新位置 x = x + Δt v*
             wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v_star, dt], device=dev)
+            # Apply boundary response before rebuilding grid / solving divergence.
+            self._apply_bounds_with_stats(self.v_star, bounds_stats, dev)
             # 6) 位置更新后重新算邻居、ρ、α（论文 line 16–20）
-            with wp.ScopedTimer("grid build", active=False):
+            def _build_grid_phase_2():
                 self.sph_model.grid.build(self.x, self.smoothing_length)
+            self._timed_block("grid rebuild", _build_grid_phase_2, dev)
             wp.launch(
                 kernel=rho_dfsph,
                 dim=self.n,
@@ -554,76 +785,115 @@ class wcsph:
                 device=dev,
             )
             # 7) 散度自由修正 (Algorithm 2)：至少 1 次迭代
-            for _ in range(self.dfsph_max_iters_divergence):
-                wp.launch(
-                    kernel=compute_density_change_rate,
-                    dim=self.n,
-                    inputs=[
-                        self.sph_model.grid.id,
-                        self.x,
-                        self.v_star,
-                        self.mass,
-                        self.smoothing_length,
-                        self.d_rho_dt,
-                    ],
-                    device=dev,
-                )
-                wp.launch(
-                    kernel=compute_kappa_divergence,
-                    dim=self.n,
-                    inputs=[self.d_rho_dt, self.rho, self.factor, dt, self.kappa],
-                    device=dev,
-                )
-                wp.launch(
-                    kernel=apply_divergence_free_correction,
-                    dim=self.n,
-                    inputs=[
-                        self.sph_model.grid.id,
-                        self.x,
-                        self.v_star,
-                        self.mass,
-                        self.rho,
-                        self.rho_0,
-                        self.kappa,
-                        self.smoothing_length,
-                        dt,
-                    ],
-                    device=dev,
-                )
+            with wp.ScopedTimer("divergence correct iteration", active=self.verbose):
+                self._sync_for_timing(dev)
+                prev_divergence_max = None
+                for it in range(self.dfsph_max_iters_divergence):
+                    self._timed_kernel(
+                        name="compute_density_change_rate(div)",
+                        kernel=compute_density_change_rate,
+                        dim=self.n,
+                        inputs=[
+                            self.sph_model.grid.id,
+                            self.x,
+                            self.v_star,
+                            self.mass,
+                            self.smoothing_length,
+                            self.d_rho_dt,
+                        ],
+                        device=dev,
+                    )
+                    if self.log_dfsph_iteration_metrics:
+                        d_rho_dt_np = self.d_rho_dt.numpy()
+                        div_abs_np = np.abs(d_rho_dt_np)
+                        div_max = float(np.max(div_abs_np))
+                        div_mean = float(np.mean(div_abs_np))
+                        if prev_divergence_max is None:
+                            div_trend = "n/a"
+                        else:
+                            div_trend = "down" if div_max <= prev_divergence_max else "up"
+                        print(
+                            f"        [div iter {it + 1}/{self.dfsph_max_iters_divergence}] "
+                            f"|drho_dt|(max/mean)=({div_max:.6e}/{div_mean:.6e}) [{div_trend}]"
+                        )
+                        prev_divergence_max = div_max
+                    self._timed_kernel(
+                        name="compute_kappa_divergence",
+                        kernel=compute_kappa_divergence,
+                        dim=self.n,
+                        inputs=[self.d_rho_dt, self.rho, self.factor, dt, self.kappa],
+                        device=dev,
+                    )
+                    self._timed_kernel(
+                        name="apply_divergence_free_correction",
+                        kernel=apply_divergence_free_correction,
+                        dim=self.n,
+                        inputs=[
+                            self.sph_model.grid.id,
+                            self.x,
+                            self.v_star,
+                            self.mass,
+                            self.rho,
+                            self.kappa,
+                            self.smoothing_length,
+                            dt,
+                        ],
+                        device=dev,
+                    )
+                self._sync_for_timing(dev)
             # 8) v = v*，边界与渲染坐标
             wp.launch(kernel=copy_velocity, dim=self.n, inputs=[self.v_star, self.v], device=dev)
-            wp.launch(
-                kernel=apply_bounds,
-                dim=self.n,
-                inputs=[self.x, self.v, self.bound_3d_size, -0.1],
-                device=dev,
-            )
+            # self._apply_bounds_with_stats(self.v, bounds_stats, dev)
             wp.launch(
                 kernel=to_real_world,
                 dim=self.n,
                 inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)],
                 device=dev,
             )
+            if self.profile_substep_stats and (self._substep_counter % max(self.profile_substep_interval, 1) == 0):
+                wp.launch(
+                    kernel=get_neighbor,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.smoothing_length,
+                        self.nei_count,
+                    ],
+                    device=dev,
+                )
+                self._sync_for_timing(dev)
+                nei_np = self.nei_count.numpy()
+                v_np = self.v.numpy()
+                v_norm = np.linalg.norm(v_np, axis=1)
+                print(
+                    "        stats: "
+                    f"nei(mean/p95/max)=({nei_np.mean():.1f}/{np.percentile(nei_np, 95):.1f}/{int(nei_np.max())}), "
+                    f"vmax={v_norm.max():.4f}, vmean={v_norm.mean():.4f}"
+                )
+            self._substep_counter += 1
         if self.use_dfsph:
             _dfsph_substep()
         else:
             _wcsph_substep()
+        self._print_substep_metrics(bounds_stats, self.device)
 
     def preparation(self) :
         with wp.ScopedTimer("preparation", active=True):
             dev = self.device
             self.sph_model.grid.build(self.x, self.smoothing_length)
-            wp.launch(
-                kernel=get_neighbor,
-                dim=self.n,
-                inputs=[
-                    self.sph_model.grid.id,
-                    self.x,
-                    self.smoothing_length,
-                    self.nei_count,
-                ],
-                device=dev,
-            )
+            if self.enable_neighbor_count:
+                wp.launch(
+                    kernel=get_neighbor,
+                    dim=self.n,
+                    inputs=[
+                        self.sph_model.grid.id,
+                        self.x,
+                        self.smoothing_length,
+                        self.nei_count,
+                    ],
+                    device=dev,
+                )
             # 初始密度：写入 self.rho，并传入 grid_id
             wp.launch(
                 kernel=rho_dfsph,
@@ -674,12 +944,17 @@ class wcsph:
 
     def step(self) :
         # pass
+        if self.verbose and not self.sync_timers and not self._timing_mode_notified:
+            print("timing note: verbose timers are async launch times; set sync_timers=True for accurate GPU timings")
+            self._timing_mode_notified = True
         with wp.ScopedTimer("step", active=True):
+            self.compute_sim_dt()
+            sub_dt = float(self.sim_dt) / float(max(self.sub_step_num, 1))
             for _ in range(self.sub_step_num):
                 with wp.ScopedTimer("sub_step", active=False):
-                    self.sub_step()
+                    self.sub_step(sub_dt)
                     # print(self.render_x)
-                    self.sim_time += self.sim_dt
+                    self.sim_time += sub_dt
 
     def render_test(self):
         # if self.renderer is None:
@@ -712,118 +987,86 @@ class wcsph:
             wp.launch(
                 kernel=to_real_world,
                 dim=self.n,
-                inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)])
-            
-            self.renderer.begin_frame(self.sim_time)
-            
-            # render_x_np = self.render_x.numpy()
-
-            density_buffer = wp.zeros(
-                (
-                    self.volume_res_x, 
-                    self.volume_res_y, 
-                    self.volume_res_z
-                ), 
-                dtype=float, 
-                device="cuda:0"
+                inputs=[self.x, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)],
+                device=self.device,
             )
             
-            # 创建调试信息数组
-            debug_info = wp.zeros(3, dtype=wp.vec3, device="cuda:0")
+            # self.renderer.begin_frame(self.sim_time)
+            # if self.enable_volume_mesh and (self._frame_index % self.volume_mesh_update_interval == 0):
+            #     density_buffer = wp.zeros(
+            #         (
+            #             self.volume_res_x,
+            #             self.volume_res_y,
+            #             self.volume_res_z,
+            #         ),
+            #         dtype=float,
+            #         device=self.device,
+            #     )
+            #     debug_info = wp.zeros(3, dtype=wp.vec3, device=self.device)
 
-            wp.launch(
-                kernel=rasterize_particles_to_nvdb_volume,
-                dim=self.n,
-                inputs=[
-                    self.x,
-                    self.volume.id,
-                    density_buffer,  # 添加 density_buffer
-                    self.smoothing_length,  # 注意单位转换
-                    self.p_volume,
-                    self.volume_res_x,  # 添加分辨率参数
-                    self.volume_res_y,
-                    self.volume_res_z,
-                    debug_info  # 添加调试信息
-                ],
-                device="cuda:0"
-            )
-            
-            # 初始化或更新 MarchingCubes 上下文
-            if self.mc is None:
-                self.mc = wp.MarchingCubes(
-                    nx=self.volume_res_x,
-                    ny=self.volume_res_y,
-                    nz=self.volume_res_z,
-                    domain_bounds_lower_corner=wp.vec3(self.world_min[0], self.world_min[1], self.world_min[2]),
-                    domain_bounds_upper_corner=wp.vec3(self.world_max[0], self.world_max[1], self.world_max[2]),
-                    device="cuda:0"
-                )
-            else:
-                # 更新边界（分辨率在初始化时已确定，通常不需要改变）
-                self.mc.domain_bounds_lower_corner = wp.vec3(self.world_min[0], self.world_min[1], self.world_min[2])
-                self.mc.domain_bounds_upper_corner = wp.vec3(self.world_max[0], self.world_max[1], self.world_max[2])
+            #     wp.launch(
+            #         kernel=rasterize_particles_to_nvdb_volume,
+            #         dim=self.n,
+            #         inputs=[
+            #             self.x,
+            #             self.volume.id,
+            #             density_buffer,
+            #             self.smoothing_length,
+            #             self.p_volume,
+            #             self.volume_res_x,
+            #             self.volume_res_y,
+            #             self.volume_res_z,
+            #             debug_info,
+            #         ],
+            #         device=self.device,
+            #     )
 
-            # 5. 对 volume density 做一次 3D 可分离高斯模糊，再 marching cubes
-            volume_smooth_iters = self.volume_smooth_iters
-            radius = self.volume_gaussian_radius
-            sigma = self.volume_gaussian_sigma
-            dim_vol = (self.volume_res_x, self.volume_res_y, self.volume_res_z)
-            density_smoothed = wp.zeros(dim_vol, dtype=float, device=self.device)
-            buf_a = wp.zeros(dim_vol, dtype=float, device=self.device)
-            buf_b = wp.zeros(dim_vol, dtype=float, device=self.device)
-            weights_np = _gaussian_1d_weights(radius, sigma)
-            weights_wp = wp.array(weights_np, dtype=float, device=self.device)
-            for _ in range(volume_smooth_iters):
-                src = density_buffer if _ == 0 else density_smoothed
-                wp.launch(kernel=smooth_volume_1d_x, dim=dim_vol, inputs=[src, buf_a, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
-                wp.launch(kernel=smooth_volume_1d_y, dim=dim_vol, inputs=[buf_a, buf_b, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
-                wp.launch(kernel=smooth_volume_1d_z, dim=dim_vol, inputs=[buf_b, density_smoothed, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
-            field_for_mc = density_smoothed if volume_smooth_iters > 0 else density_buffer
+            #     if self.mc is None:
+            #         self.mc = wp.MarchingCubes(
+            #             nx=self.volume_res_x,
+            #             ny=self.volume_res_y,
+            #             nz=self.volume_res_z,
+            #             domain_bounds_lower_corner=wp.vec3(self.world_min[0], self.world_min[1], self.world_min[2]),
+            #             domain_bounds_upper_corner=wp.vec3(self.world_max[0], self.world_max[1], self.world_max[2]),
+            #             device=self.device,
+            #         )
+            #     else:
+            #         self.mc.domain_bounds_lower_corner = wp.vec3(self.world_min[0], self.world_min[1], self.world_min[2])
+            #         self.mc.domain_bounds_upper_corner = wp.vec3(self.world_max[0], self.world_max[1], self.world_max[2])
 
-            self.mc.surface(
-                field=field_for_mc,
-                threshold=self.volume_threshold
-            )
-            
-            # 6. 渲染 mesh（volume 已平滑，无需再对顶点做拉普拉斯）
-            if self.mc.verts is not None and self.mc.verts.shape[0] > 0:
-                indices_np = self.mc.indices.numpy()
-                
-                if self.mc.verts.shape[0] > 0 and self.mc.indices.shape[0] > 0:
-                    real_verts = wp.empty(self.mc.verts.shape[0], dtype=wp.vec3)
-                    test_color = wp.full(self.mc.verts.shape[0], wp.vec3(1.0, 0.0, 0.0), device=self.device)
-                    colors = wp.empty(self.mc.verts.shape[0], dtype=wp.vec3)
-                    wp.launch(
-                            kernel=to_real_world,
-                            dim=self.mc.verts.shape[0],
-                            inputs=[self.mc.verts, real_verts, 0.01, wp.vec3(0.0, 0.0, 0.0)]
-                        )
-                    # wp.launch(
-                    #     kernel=color_test,
-                    #     dim=self.mc.verts.shape[0],
-                    #     inputs=[self.mc.verts, colors]
-                    # )
-                    verts_np = real_verts.numpy()
-                    # color_np = test_color.numpy()
-                    # self.renderer.render_mesh(
-                    #     name="fluid_mesh",
-                    #     points=verts_np,
-                    #     indices=indices_np,
-                    #     update_topology=True,
-                    #     # colors=color_np,
-                    # )
-            
+            #     volume_smooth_iters = self.volume_smooth_iters
+            #     radius = self.volume_gaussian_radius
+            #     sigma = self.volume_gaussian_sigma
+            #     dim_vol = (self.volume_res_x, self.volume_res_y, self.volume_res_z)
+            #     density_smoothed = wp.zeros(dim_vol, dtype=float, device=self.device)
+            #     buf_a = wp.zeros(dim_vol, dtype=float, device=self.device)
+            #     buf_b = wp.zeros(dim_vol, dtype=float, device=self.device)
+            #     weights_np = _gaussian_1d_weights(radius, sigma)
+            #     weights_wp = wp.array(weights_np, dtype=float, device=self.device)
+            #     for _ in range(volume_smooth_iters):
+            #         src = density_buffer if _ == 0 else density_smoothed
+            #         wp.launch(kernel=smooth_volume_1d_x, dim=dim_vol, inputs=[src, buf_a, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
+            #         wp.launch(kernel=smooth_volume_1d_y, dim=dim_vol, inputs=[buf_a, buf_b, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
+            #         wp.launch(kernel=smooth_volume_1d_z, dim=dim_vol, inputs=[buf_b, density_smoothed, self.volume_res_x, self.volume_res_y, self.volume_res_z, weights_wp, radius], device=self.device)
+            #     field_for_mc = density_smoothed if volume_smooth_iters > 0 else density_buffer
+
+            #     self.mc.surface(
+            #         field=field_for_mc,
+            #         threshold=self.volume_threshold,
+            #     )
+
             # 可选：同时渲染粒子点（用于调试）
-            wp.launch(
-                kernel=velocity_visualize,
-                dim=self.n,
-                inputs=[self.v, self.colors]
-            )
+            # wp.launch(
+            #     kernel=velocity_visualize,
+            #     dim=self.n,
+            #     inputs=[self.v, self.colors],
+            #     device=self.device,
+            # )
             self.renderer.render_points(
-                points=self.render_x.numpy(), 
-                radius=self.particle_radius * 0.01, 
-                name="points", 
-                colors=self.colors.numpy()
+                points=self.render_x,
+                radius=self.particle_radius * 0.01,
+                name="points",
+                # colors=self.colors.numpy(),
             )
 
             # grid_pts = wp.array(self.get_voxel_positions(), dtype=wp.vec3)
@@ -844,6 +1087,7 @@ class wcsph:
 
             
             self.renderer.end_frame()
+            self._frame_index += 1
 
     def get_voxel_positions(self, return_centers=True, return_indices=False, filter_active=False):
         """
@@ -983,13 +1227,17 @@ class wcsph:
             points_np = np.array(points.GetPointsAttr().Get())
             # 复制一份并将 x 取反后拼接到原粒子
             points_copy = np.array(points_np, copy=True)
-            points_copy[:, 0] = points_copy[:, 0] + 0.5
+            # points_copy[:, 0] = points_copy[:, 0] + 0.5
 
             blue_color = np.full((len(points_copy), 3), (0.0, 0.0, 1.0))
-            yellow_color = np.full((len(points_copy), 3), (1.0, 1.0, 0.0))
+            # yellow_color = np.full((len(points_copy), 3), (1.0, 1.0, 0.0))
 
-            points_np = np.concatenate([points_np, points_copy], axis=0)
-            colors_np = np.concatenate([blue_color, yellow_color], axis=0)
+            # points_np = np.concatenate([points_np, points_copy], axis=0)
+            colors_np = np.concatenate(
+                [
+                    blue_color, 
+                    # yellow_color,
+                ], axis=0)
             self.particle_radius = points.GetWidthsAttr().Get()[0] * 0.5 * 100.0
             self.x = wp.array(points_np, dtype=wp.vec3, device=self.device)
             self.colors = wp.array(colors_np, dtype=wp.vec3, device=self.device)
@@ -1018,10 +1266,14 @@ class wcsph:
 
 if __name__ == "__main__" :
     test = wcsph(True)
-    test.use_dfsph = False
+    test.use_dfsph = True
+    test.sync_timers = True
+    test.profile_substep_stats = True
+    test.profile_substep_interval = 1
+    test.enable_neighbor_count = False
     test.preparation()
-    test.sub_step_num = 12
-    test.sim_dt = 0.005
+    test.sub_step_num = 4
+    test.sim_dt = 1.0 / 60
     pt_array = test.x
     pt_nei_count = test.nei_count
     # print(pt_nei_count)
@@ -1031,7 +1283,7 @@ if __name__ == "__main__" :
     for i in range(6000) :
         with wp.ScopedTimer("frame", active=True):
             test.step()
-        # with wp.ScopedTimer("render", active=True):
+        with wp.ScopedTimer("render", active=True):
             test.render()
             # test.render_test()
     # test.renderer.save()
