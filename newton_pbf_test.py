@@ -76,7 +76,7 @@ class NewtonPBFTest:
         self.load_from_usd = load_from_usd
         self.color_field = color_field
         self.sim_time = 0.0
-        self.frame_dt = 1.0 / 20.0
+        self.frame_dt = 1.0 / 30.0
         self.sub_step_num = 4
         self.sim_dt = self.frame_dt / float(self.sub_step_num)
         self.fixed_dt = self.sim_dt
@@ -130,7 +130,7 @@ class NewtonPBFTest:
         self.solver = SolverPBF(
             self.model,
             SolverPBF.PbfConfig(
-                max_iterations=10,
+                max_iterations=8,
                 lambda_epsilon=100,
                 # min_neighbors_for_lambda=4,
                 # scorr_k=0.001,
