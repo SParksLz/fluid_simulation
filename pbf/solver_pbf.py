@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-import math
 
 import warp as wp
 
@@ -25,15 +24,11 @@ def cube(x: float):
 def get_cubic(r_norm: float, radius: float):
     res = float(0.0)
     h = radius
-    k = 8.0 / (wp.pi * cube(h))
-    q = r_norm / h
-    if q <= 1.0:
-        if q <= 0.5:
-            q2 = square(q)
-            q3 = q2 * q
-            res = k * (6.0 * q3 - 6.0 * q2 + 1.0)
-        else:
-            res = 2.0 * k * cube(1.0 - q)
+    if h > 0.0 and r_norm > 0.0 and r_norm < h:
+        h2 = h * h
+        rhs = h2 - r_norm * r_norm
+        k = 315.0 / (64.0 * wp.pi * cube(cube(h)))
+        res = k * cube(rhs)
     return res
 
 
@@ -42,15 +37,11 @@ def get_cubic_derivative(r: wp.vec3, smoothing_length: float):
     res = wp.vec3(0.0)
     r_norm = wp.length(r)
     h = smoothing_length
-    k = 8.0 / (wp.pi * cube(h))
-    q = r_norm / h
-    if r_norm > 1.0e-5 and q <= 1.0:
-        grad_q = r / (r_norm * h)
-        if q <= 0.5:
-            res = 6.0 * k * q * (3.0 * q - 2.0) * grad_q
-        else:
-            q_term = 1.0 - q
-            res = -6.0 * k * q_term * q_term * grad_q
+    if h > 0.0 and r_norm > 1.0e-6 and r_norm < h:
+        h6 = cube(h) * cube(h)
+        coeff = -45.0 / (wp.pi * h6)
+        term = (h - r_norm) * (h - r_norm) / r_norm
+        res = coeff * term * r
     return res
 
 
@@ -282,7 +273,7 @@ def compute_pbf_lambda(
 
     rho[i] = rho_i
     neighbor_count[i] = count
-    if count < min_neighbors_for_lambda:
+    if min_neighbors_for_lambda > 0 and count < min_neighbors_for_lambda:
         pbf_lambda[i] = 0.0
     else:
         pbf_lambda[i] = -c_i / (sum_grad_sq + lambda_epsilon)
@@ -353,24 +344,32 @@ def apply_position_bounds(
     particle_mask: wp.array(dtype=int),
     x_pred: wp.array(dtype=wp.vec3),
     size: wp.vec3,
+    particle_radius: float,
+    boundary_epsilon: float,
 ):
     tid = wp.tid()
     if not is_dynamic_particle(particle_flags[tid], particle_mask[tid]):
         return
 
     x = x_pred[tid]
-    if x[0] < -size[0]:
-        x[0] = -size[0]
-    if x[0] > size[0]:
-        x[0] = size[0]
-    if x[1] < -size[1]:
-        x[1] = -size[1]
-    if x[1] > size[1]:
-        x[1] = size[1]
-    if x[2] < 0.0:
-        x[2] = 0.0
-    if x[2] > size[2] * 2.0:
-        x[2] = size[2] * 2.0
+    x_min = -size[0] + particle_radius + boundary_epsilon
+    x_max = size[0] - particle_radius - boundary_epsilon
+    y_min = -size[1] + particle_radius + boundary_epsilon
+    y_max = size[1] - particle_radius - boundary_epsilon
+    z_min = particle_radius + boundary_epsilon
+    z_max = size[2] * 2.0 - particle_radius - boundary_epsilon
+    if x[0] < x_min:
+        x[0] = x_min
+    if x[0] > x_max:
+        x[0] = x_max
+    if x[1] < y_min:
+        x[1] = y_min
+    if x[1] > y_max:
+        x[1] = y_max
+    if x[2] < z_min:
+        x[2] = z_min
+    if x[2] > z_max:
+        x[2] = z_max
 
     x_pred[tid] = x
 
@@ -390,6 +389,21 @@ def update_velocity_from_positions(
         v_out[tid] = v_in[tid]
         return
     v_out[tid] = (x_pred[tid] - x_in[tid]) / wp.max(dt, 1.0e-8)
+
+
+@wp.kernel
+def compute_step_displacement(
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_mask: wp.array(dtype=int),
+    x_in: wp.array(dtype=wp.vec3),
+    x_pred: wp.array(dtype=wp.vec3),
+    step_displacement: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    if not is_dynamic_particle(particle_flags[tid], particle_mask[tid]):
+        step_displacement[tid] = wp.vec3(0.0)
+        return
+    step_displacement[tid] = x_pred[tid] - x_in[tid]
 
 
 @wp.kernel
@@ -431,6 +445,8 @@ def apply_bounds(
     particle_x: wp.array(dtype=wp.vec3),
     particle_v: wp.array(dtype=wp.vec3),
     size: wp.vec3,
+    particle_radius: float,
+    boundary_epsilon: float,
     damping_coef: float,
 ):
     tid = wp.tid()
@@ -440,28 +456,35 @@ def apply_bounds(
     x = particle_x[tid]
     v = particle_v[tid]
 
-    if x[0] < -size[0]:
-        x = wp.vec3(-size[0], x[1], x[2])
+    x_min = -size[0] + particle_radius + boundary_epsilon
+    x_max = size[0] - particle_radius - boundary_epsilon
+    y_min = -size[1] + particle_radius + boundary_epsilon
+    y_max = size[1] - particle_radius - boundary_epsilon
+    z_min = particle_radius + boundary_epsilon
+    z_max = size[2] * 2.0 - particle_radius - boundary_epsilon
+
+    if x[0] < x_min:
+        x = wp.vec3(x_min, x[1], x[2])
         if v[0] < 0.0:
             v = wp.vec3(v[0] * damping_coef, v[1], v[2])
-    if x[0] > size[0]:
-        x = wp.vec3(size[0], x[1], x[2])
+    if x[0] > x_max:
+        x = wp.vec3(x_max, x[1], x[2])
         if v[0] > 0.0:
             v = wp.vec3(v[0] * damping_coef, v[1], v[2])
-    if x[1] < -size[1]:
-        x = wp.vec3(x[0], -size[1], x[2])
+    if x[1] < y_min:
+        x = wp.vec3(x[0], y_min, x[2])
         if v[1] < 0.0:
             v = wp.vec3(v[0], v[1] * damping_coef, v[2])
-    if x[1] > size[1]:
-        x = wp.vec3(x[0], size[1], x[2])
+    if x[1] > y_max:
+        x = wp.vec3(x[0], y_max, x[2])
         if v[1] > 0.0:
             v = wp.vec3(v[0], v[1] * damping_coef, v[2])
-    if x[2] < 0.0:
-        x = wp.vec3(x[0], x[1], 0.0)
+    if x[2] < z_min:
+        x = wp.vec3(x[0], x[1], z_min)
         if v[2] < 0.0:
             v = wp.vec3(v[0], v[1], v[2] * damping_coef)
-    if x[2] > size[2] * 2.0:
-        x = wp.vec3(x[0], x[1], size[2] * 2.0)
+    if x[2] > z_max:
+        x = wp.vec3(x[0], x[1], z_max)
         if v[2] > 0.0:
             v = wp.vec3(v[0], v[1], v[2] * damping_coef)
 
@@ -472,12 +495,12 @@ def apply_bounds(
 class SolverPBF(SolverBase):
     @dataclass
     class PbfConfig:
-        max_iterations: int = 4
-        lambda_epsilon: float = 1.0e-6
-        min_neighbors_for_lambda: int = 8
-        scorr_k: float = 0.1
+        max_iterations: int = 10
+        lambda_epsilon: float = 100.0
+        min_neighbors_for_lambda: int = 0
+        scorr_k: float = 1.0e-4
         scorr_n: float = 4.0
-        scorr_q: float = 0.2
+        scorr_q: float = 0.3
         max_delta_position: float = 0.0
         xsph_c: float = 0.01
         particle_radius: float = 0.1
@@ -486,7 +509,9 @@ class SolverPBF(SolverBase):
         bound_width: float = 10.0
         bound_height: float = 10.0
         bound_length: float = 10.0
-        boundary_damping: float = -0.1
+        boundary_damping: float = 0.0
+        boundary_epsilon: float = 0.0
+        rebuild_grid_each_iteration: bool = False
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -566,6 +591,16 @@ class SolverPBF(SolverBase):
                 namespace="sph",
             )
         )
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
+                name="step_displacement",
+                frequency=frequency.PARTICLE,
+                assignment=assignment.STATE,
+                dtype=wp.vec3,
+                default=wp.vec3(0.0),
+                namespace="sph",
+            )
+        )
 
     def __init__(self, model: newton.Model, config: PbfConfig):
         super().__init__(model=model)
@@ -583,6 +618,7 @@ class SolverPBF(SolverBase):
         self._v_tmp = wp.empty(model.particle_count, dtype=wp.vec3, device=model.device)
         self._x_pred = wp.empty(model.particle_count, dtype=wp.vec3, device=model.device)
         self._bounds = wp.vec3(config.bound_width, config.bound_height, config.bound_length)
+        self._boundary_epsilon = float(config.boundary_epsilon)
 
     @property
     def smoothing_length(self) -> float:
@@ -610,16 +646,7 @@ class SolverPBF(SolverBase):
     def _w_delta_q(self, smoothing_length: float) -> float:
         q = float(self.config.scorr_q)
         r = q * smoothing_length
-        h = smoothing_length
-        if h <= 0.0:
-            return 1.0
-        k = 8.0 / (math.pi * (h**3))
-        x = r / h
-        if x <= 1.0:
-            if x <= 0.5:
-                return k * (6.0 * (x**3) - 6.0 * (x**2) + 1.0)
-            return 2.0 * k * ((1.0 - x) ** 3)
-        return 0.0
+        return float(get_cubic(r, smoothing_length))
 
     def step(
         self,
@@ -703,11 +730,24 @@ class SolverPBF(SolverBase):
             outputs=[self._x_pred],
             device=model.device,
         )
+        wp.launch(
+            kernel=apply_position_bounds,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                model.sph.particle_mask,
+                self._x_pred,
+                self._bounds,
+                particle_radius,
+                self._boundary_epsilon,
+            ],
+            device=model.device,
+        )
 
         w_delta_q = float(self._w_delta_q(smoothing_length))
 
+        model.particle_grid.build(self._x_pred, radius=smoothing_length)
         for _ in range(self.config.max_iterations):
-            model.particle_grid.build(self._x_pred, radius=smoothing_length)
             wp.launch(
                 kernel=compute_pbf_lambda,
                 dim=model.particle_count,
@@ -751,12 +791,35 @@ class SolverPBF(SolverBase):
                 inputs=[model.particle_flags, model.sph.particle_mask, self._x_pred, state_out.sph.delta_p],
                 device=model.device,
             )
-            wp.launch(
-                kernel=apply_position_bounds,
-                dim=model.particle_count,
-                inputs=[model.particle_flags, model.sph.particle_mask, self._x_pred, self._bounds],
-                device=model.device,
-            )
+            if self.config.rebuild_grid_each_iteration:
+                wp.launch(
+                    kernel=apply_position_bounds,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_flags,
+                        model.sph.particle_mask,
+                        self._x_pred,
+                        self._bounds,
+                        particle_radius,
+                        self._boundary_epsilon,
+                    ],
+                    device=model.device,
+                )
+                model.particle_grid.build(self._x_pred, radius=smoothing_length)
+
+        wp.launch(
+            kernel=apply_position_bounds,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                model.sph.particle_mask,
+                self._x_pred,
+                self._bounds,
+                particle_radius,
+                self._boundary_epsilon,
+            ],
+            device=model.device,
+        )
 
         model.particle_grid.build(self._x_pred, radius=smoothing_length)
         wp.launch(
@@ -773,6 +836,18 @@ class SolverPBF(SolverBase):
             outputs=[state_out.sph.rho],
             device=model.device,
         )
+        # wp.launch(
+        #     kernel=compute_step_displacement,
+        #     dim=model.particle_count,
+        #     inputs=[
+        #         model.particle_flags,
+        #         model.sph.particle_mask,
+        #         state_in.particle_q,
+        #         self._x_pred,
+        #     ],
+        #     outputs=[state_out.sph.step_displacement],
+        #     device=model.device,
+        # )
         wp.launch(
             kernel=update_velocity_from_positions,
             dim=model.particle_count,
@@ -818,6 +893,8 @@ class SolverPBF(SolverBase):
                 state_out.particle_q,
                 state_out.particle_qd,
                 self._bounds,
+                particle_radius,
+                self._boundary_epsilon,
                 float(self.config.boundary_damping),
             ],
             device=model.device,
