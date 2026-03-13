@@ -23,7 +23,7 @@ if not hasattr(wp, "DeviceLike"):
     wp.DeviceLike = _DeviceLike
 
 import newton
-from pbf.solver_pbf import SolverPBF
+from solver.pbf.solver_pbf import SolverPBF
 from wcsph_kernel import to_micro_world, to_real_world
 
 
@@ -130,7 +130,7 @@ class NewtonPBFTest:
         self.solver = SolverPBF(
             self.model,
             SolverPBF.PbfConfig(
-                max_iterations=8,
+                max_iterations=4,
                 lambda_epsilon=100,
                 # min_neighbors_for_lambda=4,
                 # scorr_k=0.001,

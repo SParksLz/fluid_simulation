@@ -6,7 +6,7 @@ import warp as wp
 from pxr import Usd, UsdGeom
 
 import newton
-from sph.solver_wcsph import SolverWCSPH
+from solver.sph.solver_wcsph import SolverWCSPH
 from wcsph_kernel import to_micro_world, to_real_world
 
 
