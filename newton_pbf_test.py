@@ -24,7 +24,6 @@ if not hasattr(wp, "DeviceLike"):
 
 import newton
 from solver.pbf.solver_pbf import SolverPBF
-from wcsph_kernel import to_micro_world, to_real_world
 
 
 @wp.kernel
@@ -76,12 +75,15 @@ class NewtonPBFTest:
         self.load_from_usd = load_from_usd
         self.color_field = color_field
         self.sim_time = 0.0
-        self.frame_dt = 1.0 / 30.0
-        self.sub_step_num = 4
+        self.frame_dt = 1.0 / 60.0
+        self.sub_step_num = 1
         self.sim_dt = self.frame_dt / float(self.sub_step_num)
         self.fixed_dt = self.sim_dt
-        self.bound_size = 100.0
-        self.gravity = -10.0
+        self.length_scale = 0.01
+        self.bound_width = 1.0
+        self.bound_height = 1.0
+        self.bound_length = 1.0
+        self.gravity = -10.0 * self.length_scale
         self.camera_pos = wp.vec3(-0.16, -2.90, 0.69)
         self.camera_pitch = -0.6
         self.camera_yaw = 90.5
@@ -94,7 +96,7 @@ class NewtonPBFTest:
         self.last_substeps = 0
         self.last_frame_advance = 0.0
         self.use_graph = str(self.device).startswith("cuda")
-        self.graph_dt = self.frame_dt
+        self.graph_dt = self.fixed_dt
         self._solver_graph_forward = None
         self._solver_graph_reverse = None
         self._graph_step_parity = 0
@@ -113,11 +115,12 @@ class NewtonPBFTest:
 
         self.particle_radius = particle_radius
         self.particle_count = positions.shape[0]
+        self._configure_scene_scale(positions)
         self.colors = wp.array(colors, dtype=wp.vec3, device=self.device)
         self.render_x = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
         self.point_radii = wp.full(
             self.particle_count,
-            self.particle_radius * 0.01,
+            self.particle_radius,
             dtype=wp.float32,
             device=self.device,
         )
@@ -131,19 +134,19 @@ class NewtonPBFTest:
             self.model,
             SolverPBF.PbfConfig(
                 max_iterations=4,
-                lambda_epsilon=100,
-                # min_neighbors_for_lambda=4,
+                lambda_epsilon=1.0e6,
+                min_neighbors_for_lambda=8,
                 # scorr_k=0.001,
                 # scorr_n=4.0,
                 # scorr_q=0.3,
-                # max_delta_position=0.0,
+                max_delta_position=self.particle_radius * 0.5,
                 # xsph_c=0.005,
                 particle_radius=self.particle_radius,
                 particle_length=self.particle_radius * 2.0,
-                smoothing_length_coff=1.0,
-                bound_width=self.bound_size,
-                bound_height=self.bound_size * 0.5,
-                bound_length=self.bound_size,
+                smoothing_length_coff=1.35,
+                bound_width=self.bound_width,
+                bound_height=self.bound_height,
+                bound_length=self.bound_length,
                 boundary_damping=-0.05,
             ),
         )
@@ -162,11 +165,32 @@ class NewtonPBFTest:
         points = UsdGeom.Points(fluid)
         points_np = np.array(points.GetPointsAttr().Get(), dtype=np.float32)
         colors_np = np.full((len(points_np), 3), (0.4, 0.3, 0.75), dtype=np.float32)
-        particle_radius = float(points.GetWidthsAttr().Get()[0] * 0.5 * 100.0)
+        particle_radius = float(points.GetWidthsAttr().Get()[0] * 0.5)
 
-        points_wp = wp.array(points_np, dtype=wp.vec3, device=self.device)
-        wp.launch(kernel=to_micro_world, dim=len(points_np), inputs=[points_wp, 100.0, offset], device=self.device)
-        return points_wp.numpy(), colors_np, particle_radius
+        offset_np = np.array([float(offset[0]), float(offset[1]), float(offset[2])], dtype=np.float32)
+        return points_np + offset_np, colors_np, particle_radius
+
+    def _configure_scene_scale(self, positions: np.ndarray) -> None:
+        mins = positions.min(axis=0)
+        maxs = positions.max(axis=0)
+        extent = maxs - mins
+        max_dim = float(max(np.max(extent), self.particle_radius * 8.0))
+        margin = float(max(self.particle_radius * 8.0, 0.05))
+
+        self.bound_width = float(max(abs(mins[0]), abs(maxs[0])) + margin)
+        self.bound_height = float(max(abs(mins[1]), abs(maxs[1])) + margin)
+        z_top = float(max(maxs[2] + margin, self.particle_radius * 8.0))
+        self.bound_length = 0.5 * (z_top + self.particle_radius)
+
+        center_x = float(0.5 * (mins[0] + maxs[0]))
+        center_y = float(0.5 * (mins[1] + maxs[1]))
+        self.camera_pos = wp.vec3(
+            center_x,
+            center_y - 2.4 * max_dim,
+            float(maxs[2] + 0.75 * max_dim),
+        )
+        self.camera_pitch = -0.35
+        self.camera_yaw = 90.0
 
     def build_model(self, positions: np.ndarray) -> newton.Model:
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
@@ -174,8 +198,8 @@ class NewtonPBFTest:
         SolverPBF.register_custom_attributes(builder)
 
         rest_density = 1000.0
-        surface_tension = 0.12
-        viscosity = 0.01
+        surface_tension = 0.12 * (self.length_scale ** 3)
+        viscosity = 0.01 * (self.length_scale ** 2)
         mass = 0.8 * (self.particle_radius * 2.0) ** 3 * rest_density
 
         builder.add_particles(
@@ -285,34 +309,39 @@ class NewtonPBFTest:
 
     def step(self):
         frame_start_time = self.sim_time
-        # dt = self.fixed_dt
-        dt = self.frame_dt
-        if dt <= 0.0:
-            raise RuntimeError(f"PBF step produced a non-positive fixed dt: {dt:.6e}")
+        frame_time_left = self.frame_dt
+        substeps = 0
 
-        self.sim_dt = dt
-        if self.use_graph and self._solver_graph_forward is not None and self._solver_graph_reverse is not None:
-            if self._graph_step_parity == 0:
-                wp.capture_launch(self._solver_graph_forward)
+        while frame_time_left > 0.0 and substeps < self.sub_step_num:
+            dt = min(self.fixed_dt, frame_time_left)
+            if dt <= 0.0:
+                raise RuntimeError(f"PBF step produced a non-positive fixed dt: {dt:.6e}")
+
+            self.sim_dt = dt
+            if (
+                self.use_graph
+                and self._solver_graph_forward is not None
+                and self._solver_graph_reverse is not None
+                and abs(dt - self.graph_dt) < 1.0e-12
+            ):
+                if self._graph_step_parity == 0:
+                    wp.capture_launch(self._solver_graph_forward)
+                else:
+                    wp.capture_launch(self._solver_graph_reverse)
+                self._graph_step_parity ^= 1
             else:
-                wp.capture_launch(self._solver_graph_reverse)
-            self._graph_step_parity ^= 1
-        else:
-            self.solver.step(self.state_0, self.state_1, control=None, contacts=None, dt=dt)
+                self.solver.step(self.state_0, self.state_1, control=None, contacts=None, dt=dt)
 
-        self.state_0, self.state_1 = self.state_1, self.state_0
-        self.sim_time += dt
+            self.state_0, self.state_1 = self.state_1, self.state_0
+            self.sim_time += dt
+            frame_time_left -= dt
+            substeps += 1
 
-        self.last_substeps = 1
+        self.last_substeps = substeps
         self.last_frame_advance = self.sim_time - frame_start_time
 
     def render(self):
-        wp.launch(
-            kernel=to_real_world,
-            dim=self.particle_count,
-            inputs=[self.state_0.particle_q, self.render_x, 0.01, wp.vec3(0.0, 0.0, 0.0)],
-            device=self.device,
-        )
+        wp.copy(self.render_x, self.state_0.particle_q)
 
         # if self.color_field == "lambda":
         #     wp.launch(
