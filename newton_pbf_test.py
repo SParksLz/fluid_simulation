@@ -134,7 +134,7 @@ class NewtonPBFTest:
             self.model,
             SolverPBF.PbfConfig(
                 max_iterations=4,
-                lambda_epsilon=1.0e6,
+                lambda_epsilon=3.0e4,
                 min_neighbors_for_lambda=8,
                 # scorr_k=0.001,
                 # scorr_n=4.0,
@@ -200,7 +200,7 @@ class NewtonPBFTest:
         rest_density = 1000.0
         surface_tension = 0.12 * (self.length_scale ** 3)
         viscosity = 0.01 * (self.length_scale ** 2)
-        mass = 0.8 * (self.particle_radius * 2.0) ** 3 * rest_density
+        mass = (self.particle_radius * 2.0) ** 3 * rest_density
 
         builder.add_particles(
             pos=positions.tolist(),

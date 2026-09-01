@@ -24,7 +24,7 @@ def cube(x: float):
 def get_cubic(r_norm: float, radius: float):
     res = float(0.0)
     h = radius
-    if h > 0.0 and r_norm > 0.0 and r_norm < h:
+    if h > 0.0 and r_norm < h:
         h2 = h * h
         rhs = h2 - r_norm * r_norm
         k = 315.0 / (64.0 * wp.pi * cube(cube(h)))
@@ -275,10 +275,10 @@ def compute_pbf_lambda(
     for j in neighbors:
         if not is_neighbor_particle_active(particle_flags[j]):
             continue
-        if j != i:
-            count += 1
         xij = xi - x_pred[j]
         r = wp.length(xij)
+        if j != i and r < smoothing_length:
+            count += 1
         mass_j = mass[j]
         rho_i += mass_j * get_cubic(r, smoothing_length)
         grad_j = -(mass_j / rho0_i) * get_cubic_derivative(xij, smoothing_length)
@@ -286,7 +286,10 @@ def compute_pbf_lambda(
         grad_i -= grad_j
 
     sum_grad_sq += wp.dot(grad_i, grad_i)
-    c_i = rho_i / rho0_i - 1.0
+    # Enforce incompressibility as a unilateral constraint.  Allowing a
+    # negative density error produces a positive lambda that attracts
+    # under-dense particles and leads to tensile clumping at free surfaces.
+    c_i = wp.max(rho_i / rho0_i - 1.0, 0.0)
 
     rho[i] = rho_i
     neighbor_count[i] = count
