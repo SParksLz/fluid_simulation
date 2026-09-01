@@ -149,8 +149,6 @@ def acceleration_non_pressure(
     mass: wp.array(dtype=float),
     surface_tension: wp.array(dtype=float),
     viscosity: wp.array(dtype=float),
-    gravity: wp.array(dtype=wp.vec3),
-    particle_world: wp.array(dtype=wp.int32),
     smoothing_length: float,
     grid_id: wp.uint64,
     particle_a: wp.array(dtype=wp.vec3),
@@ -185,17 +183,16 @@ def acceleration_non_pressure(
             smoothing_length,
         )
 
-    world_idx = particle_world[i]
-    world_g = gravity[wp.max(world_idx, 0)]
-    particle_a[i] = acc + world_g
+    particle_a[i] = acc
 
 
 @wp.kernel
-def predict_velocity(
+def predict_velocity_with_gravity(
     particle_flags: wp.array(dtype=wp.int32),
     particle_mask: wp.array(dtype=int),
     v_in: wp.array(dtype=wp.vec3),
-    a: wp.array(dtype=wp.vec3),
+    gravity: wp.array(dtype=wp.vec3),
+    particle_world: wp.array(dtype=wp.int32),
     dt: float,
     v_pred: wp.array(dtype=wp.vec3),
 ):
@@ -203,7 +200,9 @@ def predict_velocity(
     if not is_dynamic_particle(particle_flags[tid], particle_mask[tid]):
         v_pred[tid] = v_in[tid]
         return
-    v_pred[tid] = v_in[tid] + dt * a[tid]
+    world_idx = particle_world[tid]
+    world_g = gravity[wp.max(world_idx, 0)]
+    v_pred[tid] = v_in[tid] + dt * world_g
 
 
 @wp.kernel
@@ -220,6 +219,24 @@ def predict_positions(
         x_pred[tid] = x_in[tid]
         return
     x_pred[tid] = x_in[tid] + dt * v_pred[tid]
+
+
+@wp.kernel
+def apply_non_pressure_prediction(
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_mask: wp.array(dtype=int),
+    particle_a: wp.array(dtype=wp.vec3),
+    dt: float,
+    v_pred: wp.array(dtype=wp.vec3),
+    x_pred: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    if not is_dynamic_particle(particle_flags[tid], particle_mask[tid]):
+        return
+
+    delta_v = dt * particle_a[tid]
+    v_pred[tid] = v_pred[tid] + delta_v
+    x_pred[tid] = x_pred[tid] + dt * delta_v
 
 
 @wp.kernel
@@ -674,50 +691,15 @@ class SolverPBF(SolverBase):
 
         self._update_particle_volume()
 
-        model.particle_grid.build(state_in.particle_q, radius=smoothing_length)
         wp.launch(
-            kernel=compute_density,
-            dim=model.particle_count,
-            inputs=[
-                model.particle_flags,
-                state_in.particle_q,
-                model.sph.rest_density,
-                self._particle_volume,
-                smoothing_length,
-                model.particle_grid.id,
-            ],
-            outputs=[state_out.sph.rho],
-            device=model.device,
-        )
-        wp.launch(
-            kernel=acceleration_non_pressure,
+            kernel=predict_velocity_with_gravity,
             dim=model.particle_count,
             inputs=[
                 model.particle_flags,
                 model.sph.particle_mask,
-                state_in.particle_q,
                 state_in.particle_qd,
-                state_out.sph.rho,
-                particle_radius,
-                model.particle_mass,
-                model.sph.surface_tension,
-                model.sph.viscosity,
                 model.gravity,
                 model.particle_world,
-                smoothing_length,
-                model.particle_grid.id,
-            ],
-            outputs=[self._particle_accel],
-            device=model.device,
-        )
-        wp.launch(
-            kernel=predict_velocity,
-            dim=model.particle_count,
-            inputs=[
-                model.particle_flags,
-                model.sph.particle_mask,
-                state_in.particle_qd,
-                self._particle_accel,
                 dt,
             ],
             outputs=[self._v_pred],
@@ -744,9 +726,69 @@ class SolverPBF(SolverBase):
             device=model.device,
         )
 
+        model.particle_grid.build(self._x_pred, radius=smoothing_length)
+        wp.launch(
+            kernel=compute_density,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                self._x_pred,
+                model.sph.rest_density,
+                self._particle_volume,
+                smoothing_length,
+                model.particle_grid.id,
+            ],
+            outputs=[state_out.sph.rho],
+            device=model.device,
+        )
+        wp.launch(
+            kernel=acceleration_non_pressure,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                model.sph.particle_mask,
+                self._x_pred,
+                self._v_pred,
+                state_out.sph.rho,
+                particle_radius,
+                model.particle_mass,
+                model.sph.surface_tension,
+                model.sph.viscosity,
+                smoothing_length,
+                model.particle_grid.id,
+            ],
+            outputs=[self._particle_accel],
+            device=model.device,
+        )
+        wp.launch(
+            kernel=apply_non_pressure_prediction,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                model.sph.particle_mask,
+                self._particle_accel,
+                dt,
+                self._v_pred,
+                self._x_pred,
+            ],
+            device=model.device,
+        )
+        wp.launch(
+            kernel=apply_position_bounds,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                model.sph.particle_mask,
+                self._x_pred,
+                self._bounds,
+                particle_radius,
+                self._boundary_epsilon,
+            ],
+            device=model.device,
+        )
+
         w_delta_q = float(self._w_delta_q(smoothing_length))
 
-        model.particle_grid.build(self._x_pred, radius=smoothing_length)
         for _ in range(self.config.max_iterations):
             wp.launch(
                 kernel=compute_pbf_lambda,
@@ -821,7 +863,10 @@ class SolverPBF(SolverBase):
             device=model.device,
         )
 
-        model.particle_grid.build(self._x_pred, radius=smoothing_length)
+        # Reuse the single grid built from the gravity-predicted positions for
+        # the pressure solve, final density, and XSPH passes.  With per-iteration
+        # rebuilds disabled, all neighbor kernels intentionally share this
+        # fixed candidate set.
         wp.launch(
             kernel=compute_density,
             dim=model.particle_count,
