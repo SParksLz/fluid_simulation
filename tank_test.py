@@ -156,11 +156,11 @@ class wcsph:
         self.substep_metrics_log_enabled = True
         self.substep_metrics_log_path = Path(__file__).parent / "temp" / "dfsph_substep_metrics.csv"
         self.log_adaptive_dt = True
-        self._substep_counter = 0
+        self._substep_counter = 12
         self._timing_mode_notified = False
         self.load_from_usd = load_from_usd
         self.sim_time = 0.0
-        self.sim_dt = 1.0 / 60.0
+        self.sim_dt = 1.0 / 120.0
         self.device = "cuda:0"
 
         # self.particle_radius = 0.0125

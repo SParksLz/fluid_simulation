@@ -35,7 +35,7 @@ class NewtonTankTest:
         self.sim_time = 0.0
         self.frame_dt = 1.0 / 60.0
         self.sim_dt = self.frame_dt / 4.0
-        self.sub_step_num = 4
+        self.sub_step_num = 1
         self.cfl_factor = 0.4
         self.dt_min = 1.0e-4
         self.dt_max = self.frame_dt

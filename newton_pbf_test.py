@@ -76,7 +76,7 @@ class NewtonPBFTest:
         self.color_field = color_field
         self.sim_time = 0.0
         self.frame_dt = 1.0 / 60.0
-        self.sub_step_num = 1
+        self.sub_step_num = 2
         self.sim_dt = self.frame_dt / float(self.sub_step_num)
         self.fixed_dt = self.sim_dt
         self.length_scale = 0.01
@@ -140,7 +140,7 @@ class NewtonPBFTest:
                 # scorr_n=4.0,
                 # scorr_q=0.3,
                 max_delta_position=self.particle_radius * 0.5,
-                # xsph_c=0.005,
+                xsph_c=0.05,
                 particle_radius=self.particle_radius,
                 particle_length=self.particle_radius * 2.0,
                 smoothing_length_coff=1.35,

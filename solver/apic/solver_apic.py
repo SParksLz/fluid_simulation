@@ -154,8 +154,8 @@ def solve_incompressibility(
     pressure: wp.array,
     velocity: wp.array,
     quiet: bool = True,
-    tol: float = 1.0e-5,
-    max_iters: int = 200,
+    tol: float = 1.0e-6,
+    max_iters: int = 1000,
 ) -> tuple[float, int]:
     """Project grid velocity to a (approximately) divergence-free field."""
     rhs = wp.empty_like(pressure)
@@ -190,6 +190,157 @@ def solve_incompressibility(
     return float(residual), int(iters)
 
 
+@wp.kernel
+def accumulate_particle_separation(
+    grid: wp.uint64,
+    positions: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    delta: wp.array(dtype=wp.vec3),
+    rest_dist: float,
+    query_radius: float,
+    strength: float,
+    bound_lo: wp.vec3,
+    bound_hi: wp.vec3,
+    wall_band: float,
+):
+    """Push particles apart when closer than rest_dist (reduces clumping / volume loss).
+
+    Near walls, the into-wall component of the push is removed — otherwise one-sided
+    neighborhoods drive particles into the boundary and create a stuck crust.
+    """
+    i = wp.tid()
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        delta[i] = wp.vec3(0.0, 0.0, 0.0)
+        return
+
+    xi = positions[i]
+    disp = wp.vec3(0.0, 0.0, 0.0)
+    count = float(0.0)
+    query = wp.hash_grid_query(grid, xi, query_radius)
+    for j in query:
+        if j != i and (particle_flags[j] & ParticleFlags.ACTIVE) != 0:
+            rij = xi - positions[j]
+            d = wp.length(rij)
+            if d > 1.0e-8 and d < rest_dist:
+                n = rij / d
+                disp += n * (strength * (rest_dist - d))
+                count += 1.0
+    if count > 0.0:
+        disp = disp / count
+    else:
+        disp = wp.vec3(0.0, 0.0, 0.0)
+
+    # Kill separation components that push into nearby walls.
+    if xi[0] <= bound_lo[0] + wall_band and disp[0] < 0.0:
+        disp = wp.vec3(0.0, disp[1], disp[2])
+    if xi[0] >= bound_hi[0] - wall_band and disp[0] > 0.0:
+        disp = wp.vec3(0.0, disp[1], disp[2])
+    if xi[1] <= bound_lo[1] + wall_band and disp[1] < 0.0:
+        disp = wp.vec3(disp[0], 0.0, disp[2])
+    if xi[1] >= bound_hi[1] - wall_band and disp[1] > 0.0:
+        disp = wp.vec3(disp[0], 0.0, disp[2])
+    if xi[2] <= bound_lo[2] + wall_band and disp[2] < 0.0:
+        disp = wp.vec3(disp[0], disp[1], 0.0)
+    if xi[2] >= bound_hi[2] - wall_band and disp[2] > 0.0:
+        disp = wp.vec3(disp[0], disp[1], 0.0)
+
+    delta[i] = disp
+
+
+@wp.kernel
+def apply_particle_separation_delta(
+    positions: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    delta: wp.array(dtype=wp.vec3),
+    bound_lo: wp.vec3,
+    bound_hi: wp.vec3,
+    wall_margin: float,
+):
+    i = wp.tid()
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    p = positions[i] + delta[i]
+    lo = bound_lo + wp.vec3(wall_margin, wall_margin, wall_margin)
+    hi = bound_hi - wp.vec3(wall_margin, wall_margin, wall_margin)
+    positions[i] = wp.vec3(
+        wp.clamp(p[0], lo[0], hi[0]),
+        wp.clamp(p[1], lo[1], hi[1]),
+        wp.clamp(p[2], lo[2], hi[2]),
+    )
+
+
+@wp.kernel
+def apply_soft_wall_push(
+    positions: wp.array(dtype=wp.vec3),
+    velocities: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    bound_lo: wp.vec3,
+    bound_hi: wp.vec3,
+    wall_margin: float,
+    push_band: float,
+    push_strength: float,
+):
+    """Soft repulsion from AABB walls so particles do not form a crust on the clamp plane."""
+    i = wp.tid()
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    p = positions[i]
+    v = velocities[i]
+    lo = bound_lo + wp.vec3(wall_margin, wall_margin, wall_margin)
+    hi = bound_hi - wp.vec3(wall_margin, wall_margin, wall_margin)
+    band = wp.max(push_band, 1.0e-5)
+
+    # Left / right
+    d = p[0] - lo[0]
+    if d < band:
+        w = (band - d) / band
+        p = wp.vec3(p[0] + push_strength * w * band, p[1], p[2])
+        if v[0] < 0.0:
+            v = wp.vec3(v[0] * (1.0 - w), v[1], v[2])
+    d = hi[0] - p[0]
+    if d < band:
+        w = (band - d) / band
+        p = wp.vec3(p[0] - push_strength * w * band, p[1], p[2])
+        if v[0] > 0.0:
+            v = wp.vec3(v[0] * (1.0 - w), v[1], v[2])
+
+    # Front / back
+    d = p[1] - lo[1]
+    if d < band:
+        w = (band - d) / band
+        p = wp.vec3(p[0], p[1] + push_strength * w * band, p[2])
+        if v[1] < 0.0:
+            v = wp.vec3(v[0], v[1] * (1.0 - w), v[2])
+    d = hi[1] - p[1]
+    if d < band:
+        w = (band - d) / band
+        p = wp.vec3(p[0], p[1] - push_strength * w * band, p[2])
+        if v[1] > 0.0:
+            v = wp.vec3(v[0], v[1] * (1.0 - w), v[2])
+
+    # Floor / ceiling
+    d = p[2] - lo[2]
+    if d < band:
+        w = (band - d) / band
+        p = wp.vec3(p[0], p[1], p[2] + push_strength * w * band)
+        if v[2] < 0.0:
+            v = wp.vec3(v[0], v[1], v[2] * (1.0 - w))
+    d = hi[2] - p[2]
+    if d < band:
+        w = (band - d) / band
+        p = wp.vec3(p[0], p[1], p[2] - push_strength * w * band)
+        if v[2] > 0.0:
+            v = wp.vec3(v[0], v[1], v[2] * (1.0 - w))
+
+    positions[i] = wp.vec3(
+        wp.clamp(p[0], lo[0], hi[0]),
+        wp.clamp(p[1], lo[1], hi[1]),
+        wp.clamp(p[2], lo[2], hi[2]),
+    )
+    velocities[i] = v
+
+
 @integrand
 def update_particles(
     s: Sample,
@@ -199,6 +350,7 @@ def update_particles(
     bound_lo: wp.vec3,
     bound_hi: wp.vec3,
     clamp_eps: float,
+    wall_margin: float,
     wall_friction: float,
     particle_flags: wp.array(dtype=wp.int32),
     pos: wp.array(dtype=wp.vec3),
@@ -216,8 +368,9 @@ def update_particles(
     vel_grad[pid] = grad(grid_vel, s)
 
     pos_adv = pos_prev[pid] + dt * p_vel
-    lo = bound_lo + wp.vec3(clamp_eps, clamp_eps, clamp_eps)
-    hi = bound_hi - wp.vec3(clamp_eps, clamp_eps, clamp_eps)
+    margin = wp.max(clamp_eps, wall_margin)
+    lo = bound_lo + wp.vec3(margin, margin, margin)
+    hi = bound_hi - wp.vec3(margin, margin, margin)
 
     # Component-wise clamp + kill into-wall velocity for every violated face.
     vx = p_vel[0]
@@ -410,17 +563,28 @@ class SolverAPIC(SolverBase):
         bound_hi: tuple[float, float, float] = (1.0, 1.0, 2.0)
         clamp_eps: float = 1.0e-4
         wall_band: float = -1.0  # <0 => 0.75 * voxel_size
-        wall_friction: float = 0.15
+        wall_friction: float = 0.0
+        # Keep particles ~one radius inside the geometric AABB (reduces wall crust).
+        wall_margin: float = -1.0  # <0 => mean particle radius
+        wall_push_band: float = -1.0  # <0 => 1.5 * wall_margin
+        wall_push_strength: float = 0.35
         mass_epsilon: float = 1.0e-8
         grid_capacity_ratio: float = 16.0
         enable_projection: bool = True
-        projection_tol: float = 1.0e-5
-        projection_max_iters: int = 200
+        projection_tol: float = 1.0e-6
+        projection_max_iters: int = 1000
         projection_quiet: bool = True
-        # Stabilize APIC affine blow-up after impacts / free-surface contact.
-        c_damping: float = 0.92
-        c_norm_max: float = 25.0
-        max_particle_speed: float = 8.0
+        # Particle separation fights clumping from pure div-free projection
+        # (which does not restore absolute density / volume).
+        enable_particle_separation: bool = True
+        separation_rest_dist: float = -1.0  # <0 => mean particle spacing (2 * radius)
+        separation_strength: float = 0.55
+        separation_iterations: int = 2
+        # Preserve APIC affine modes — heavy damping kills vorticity (the APIC point).
+        # Only lightly damp + Frobenius clamp for impact stability.
+        c_damping: float = 0.998
+        c_norm_max: float = 40.0
+        max_particle_speed: float = 10.0
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -474,6 +638,17 @@ class SolverAPIC(SolverBase):
         else:
             self._wall_band = 0.75 * float(config.voxel_size)
         self._wall_friction = float(config.wall_friction)
+        if model.particle_count > 0 and float(config.wall_margin) < 0.0:
+            self._wall_margin = float(np.mean(model.particle_radius.numpy()))
+        elif float(config.wall_margin) < 0.0:
+            self._wall_margin = float(config.clamp_eps)
+        else:
+            self._wall_margin = float(config.wall_margin)
+        if float(config.wall_push_band) < 0.0:
+            self._wall_push_band = 1.5 * self._wall_margin
+        else:
+            self._wall_push_band = float(config.wall_push_band)
+        self._wall_push_strength = float(config.wall_push_strength)
         self._bsr_options = {"construction": "row_compress", "capacity": "auto"}
         self._initialized = False
         self._viz_edge_starts: wp.array | None = None
@@ -481,6 +656,9 @@ class SolverAPIC(SolverBase):
         self._viz_edge_capacity = 0
         self.last_projection_residual = 0.0
         self.last_projection_iters = 0
+        self._sep_hash_grid: wp.HashGrid | None = None
+        self._sep_delta: wp.array | None = None
+        self._sep_grid_dims: tuple[int, int, int] | None = None
 
         if model.particle_count > 0:
             self._ensure_grid(model.state().particle_q)
@@ -769,6 +947,7 @@ class SolverAPIC(SolverBase):
                     "bound_lo": self._bound_lo,
                     "bound_hi": self._bound_hi,
                     "clamp_eps": float(self.config.clamp_eps),
+                    "wall_margin": float(self._wall_margin),
                     "wall_friction": float(self._wall_friction),
                     "particle_flags": model.particle_flags,
                 },
@@ -798,5 +977,90 @@ class SolverAPIC(SolverBase):
                     ],
                     device=model.device,
                 )
+
+            if bool(self.config.enable_particle_separation):
+                self._apply_particle_separation(state_out)
+
+            if float(self._wall_push_strength) > 0.0 and float(self._wall_push_band) > 0.0:
+                wp.launch(
+                    kernel=apply_soft_wall_push,
+                    dim=model.particle_count,
+                    inputs=[
+                        state_out.particle_q,
+                        state_out.particle_qd,
+                        model.particle_flags,
+                        self._bound_lo,
+                        self._bound_hi,
+                        float(self._wall_margin),
+                        float(self._wall_push_band),
+                        float(self._wall_push_strength),
+                    ],
+                    device=model.device,
+                )
         finally:
             fem.set_default_temporary_store(None)
+
+    def _apply_particle_separation(self, state: newton.State) -> None:
+        model = self.model
+        n = int(model.particle_count)
+        if n <= 0:
+            return
+
+        if float(self.config.separation_rest_dist) > 0.0:
+            rest_dist = float(self.config.separation_rest_dist)
+        else:
+            if not hasattr(self, "_sep_rest_dist_cached"):
+                radii = model.particle_radius.numpy()
+                # Target ~one particle spacing so non-overlapping volumes fill space.
+                self._sep_rest_dist_cached = float(2.0 * float(np.mean(radii)))
+            rest_dist = float(self._sep_rest_dist_cached)
+
+        query_radius = max(rest_dist, 1.0e-5)
+        strength = float(self.config.separation_strength)
+        iters = max(1, int(self.config.separation_iterations))
+
+        # HashGrid dims: cover domain with cells ~ query_radius.
+        lo = np.asarray(self.config.bound_lo, dtype=np.float64)
+        hi = np.asarray(self.config.bound_hi, dtype=np.float64)
+        extent = np.maximum(hi - lo, query_radius)
+        dims = np.maximum(4, np.ceil(extent / query_radius).astype(int))
+        dim_x, dim_y, dim_z = int(dims[0]), int(dims[1]), int(dims[2])
+
+        if self._sep_hash_grid is None or self._sep_grid_dims != (dim_x, dim_y, dim_z):
+            self._sep_hash_grid = wp.HashGrid(dim_x, dim_y, dim_z, device=model.device)
+            self._sep_grid_dims = (dim_x, dim_y, dim_z)
+        if self._sep_delta is None or int(self._sep_delta.shape[0]) != n:
+            self._sep_delta = wp.empty(n, dtype=wp.vec3, device=model.device)
+
+        for _ in range(iters):
+            self._sep_hash_grid.build(points=state.particle_q, radius=query_radius)
+            wp.launch(
+                kernel=accumulate_particle_separation,
+                dim=n,
+                inputs=[
+                    self._sep_hash_grid.id,
+                    state.particle_q,
+                    model.particle_flags,
+                    self._sep_delta,
+                    rest_dist,
+                    query_radius,
+                    strength,
+                    self._bound_lo,
+                    self._bound_hi,
+                    max(float(self._wall_push_band), float(self._wall_margin) * 2.0),
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                kernel=apply_particle_separation_delta,
+                dim=n,
+                inputs=[
+                    state.particle_q,
+                    model.particle_flags,
+                    self._sep_delta,
+                    self._bound_lo,
+                    self._bound_hi,
+                    float(self._wall_margin),
+                ],
+                device=model.device,
+            )
