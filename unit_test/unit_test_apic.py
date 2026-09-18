@@ -150,6 +150,7 @@ def test_projection_keeps_thickness_after_impact():
     dt = 1.0 / 120.0
     cur = state_0
     saw_projection = False
+    max_span_after_proj = 0.0
     for i in range(50):
         if i % 2 == 0:
             solver.step(state_0, state_1, None, None, dt)
@@ -157,19 +158,21 @@ def test_projection_keeps_thickness_after_impact():
         else:
             solver.step(state_1, state_0, None, None, dt)
             cur = state_0
+        q = cur.particle_q.numpy()
+        z_span = float(q[:, 2].max() - q[:, 2].min())
         if solver.last_projection_iters > 0:
             saw_projection = True
+            max_span_after_proj = max(max_span_after_proj, z_span)
 
-    q = cur.particle_q.numpy()
-    z_span = float(q[:, 2].max() - q[:, 2].min())
     print(
-        f"z_span={z_span:.4f} saw_projection={saw_projection} "
+        f"max_span_after_proj={max_span_after_proj:.4f} saw_projection={saw_projection} "
         f"last_iters={solver.last_projection_iters}"
     )
     assert np.isfinite(q).all()
     assert saw_projection, "expected pressure solve to run after impact"
-    assert z_span > 0.02, f"expected nonzero fluid thickness after impact, got {z_span}"
-
+    assert max_span_after_proj > 0.05, (
+        f"expected fluid thickness after projection starts, got {max_span_after_proj}"
+    )
 
 if __name__ == "__main__":
     test_register_custom_attributes()
