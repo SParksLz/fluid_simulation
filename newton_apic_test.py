@@ -52,6 +52,7 @@ class NewtonAPICTest:
         device: str = "cuda:0",
         res: int = 12,
         voxel_size: float | None = None,
+        show_grid: bool = True,
     ) -> None:
         self.device = device
         self.sim_time = 0.0
@@ -59,6 +60,11 @@ class NewtonAPICTest:
         self.sub_step_num = 2
         self.sim_dt = self.frame_dt / float(self.sub_step_num)
         self.gravity = -10.0
+        self.show_grid = bool(show_grid)
+        self.show_domain_box = True
+        self.grid_line_width = 0.0025
+        self.grid_color = (0.85, 0.75, 0.25)
+        self.enable_projection = True
 
         self.bound_lo = (-0.5, -0.5, 0.0)
         self.bound_hi = (0.5, 0.5, 1.0)
@@ -86,6 +92,7 @@ class NewtonAPICTest:
                 bound_hi=self.bound_hi,
                 clamp_eps=1.0e-3,
                 grid_capacity_ratio=16.0,
+                enable_projection=True,
             ),
         )
 
@@ -97,6 +104,44 @@ class NewtonAPICTest:
         self.render_x = wp.empty(self.particle_count, dtype=wp.vec3, device=self.device)
         self.point_radii = wp.full(self.particle_count, self.particle_radius, dtype=wp.float32, device=self.device)
         self.colors = wp.full(self.particle_count, wp.vec3(0.25, 0.55, 0.95), dtype=wp.vec3, device=self.device)
+        self._domain_box_starts, self._domain_box_ends = self._make_domain_box_lines()
+
+    def _make_domain_box_lines(self) -> tuple[wp.array, wp.array]:
+        lo = np.array(self.bound_lo, dtype=np.float32)
+        hi = np.array(self.bound_hi, dtype=np.float32)
+        corners = np.array(
+            [
+                [lo[0], lo[1], lo[2]],
+                [hi[0], lo[1], lo[2]],
+                [hi[0], hi[1], lo[2]],
+                [lo[0], hi[1], lo[2]],
+                [lo[0], lo[1], hi[2]],
+                [hi[0], lo[1], hi[2]],
+                [hi[0], hi[1], hi[2]],
+                [lo[0], hi[1], hi[2]],
+            ],
+            dtype=np.float32,
+        )
+        edges = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ]
+        starts = np.array([corners[a] for a, _ in edges], dtype=np.float32)
+        ends = np.array([corners[b] for _, b in edges], dtype=np.float32)
+        return (
+            wp.array(starts, dtype=wp.vec3, device=self.device),
+            wp.array(ends, dtype=wp.vec3, device=self.device),
+        )
 
     def build_model(self, positions, mass, radius, volume) -> newton.Model:
         builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
@@ -118,6 +163,31 @@ class NewtonAPICTest:
             self.state_0, self.state_1 = self.state_1, self.state_0
             self.sim_time += self.sim_dt
 
+    def _ui_apic_panel(self, imgui) -> None:
+        imgui.set_next_item_open(True, imgui.Cond_.appearing)
+        if imgui.collapsing_header("APIC Visualizer"):
+            _c1, self.show_grid = imgui.checkbox("Show Nanogrid", self.show_grid)
+            _c2, self.show_domain_box = imgui.checkbox("Show Domain Box", self.show_domain_box)
+            _c3, self.grid_line_width = imgui.slider_float(
+                "Grid Line Width", self.grid_line_width, 0.0005, 0.02
+            )
+            changed_proj, self.enable_projection = imgui.checkbox(
+                "Enable Pressure Projection", self.enable_projection
+            )
+            if changed_proj:
+                self.solver.config.enable_projection = bool(self.enable_projection)
+            if getattr(self.solver, "_grid", None) is not None:
+                try:
+                    cell_count = int(self.solver._grid.cell_count())
+                except Exception:
+                    cell_count = -1
+                imgui.text(f"Active cells: {cell_count}")
+                imgui.text(f"Voxel size: {self.solver.config.voxel_size:.4f}")
+                imgui.text(
+                    f"Projection iters: {self.solver.last_projection_iters}  "
+                    f"residual: {self.solver.last_projection_residual:.3e}"
+                )
+
     def render(self) -> None:
         if self.viewer is None:
             return
@@ -129,12 +199,60 @@ class NewtonAPICTest:
             radii=self.point_radii,
             colors=self.colors,
         )
+
+        if self.show_domain_box:
+            self.viewer.log_lines(
+                "/apic/domain_box",
+                starts=self._domain_box_starts,
+                ends=self._domain_box_ends,
+                colors=(0.55, 0.55, 0.6),
+                width=0.004,
+                hidden=False,
+            )
+        else:
+            self.viewer.log_lines(
+                "/apic/domain_box",
+                starts=None,
+                ends=None,
+                colors=None,
+                hidden=True,
+            )
+
+        if self.show_grid:
+            starts, ends = self.solver.get_grid_wireframe()
+            if starts is not None and ends is not None and starts.shape[0] > 0:
+                self.viewer.log_lines(
+                    "/apic/nanogrid",
+                    starts=starts,
+                    ends=ends,
+                    colors=self.grid_color,
+                    width=float(self.grid_line_width),
+                    hidden=False,
+                )
+            else:
+                self.viewer.log_lines(
+                    "/apic/nanogrid",
+                    starts=None,
+                    ends=None,
+                    colors=None,
+                    hidden=True,
+                )
+        else:
+            self.viewer.log_lines(
+                "/apic/nanogrid",
+                starts=None,
+                ends=None,
+                colors=None,
+                hidden=True,
+            )
+
         self.viewer.end_frame()
 
     def setup_viewer(self) -> None:
         self.viewer = newton.viewer.ViewerGL()
         self.viewer.set_model(self.model)
         self.viewer.set_camera(self.camera_pos, self.camera_pitch, self.camera_yaw)
+        self.viewer.register_ui_callback(self._ui_apic_panel, position="panel")
 
     def run(self, frames: int) -> None:
         frame = 0
@@ -152,10 +270,24 @@ def main():
     parser.add_argument("--voxel-size", type=float, default=None)
     parser.add_argument("--frames", type=int, default=6000, help="Max frames for viewer; used by --no-viewer too")
     parser.add_argument("--no-viewer", action="store_true", help="Headless smoke run")
+    parser.add_argument("--hide-grid", action="store_true", help="Disable Nanogrid wireframe by default")
+    parser.add_argument("--no-projection", action="store_true", help="Disable pressure projection")
     args = parser.parse_args()
 
-    app = NewtonAPICTest(device=args.device, res=args.res, voxel_size=args.voxel_size)
-    print(f"APIC demo: {app.particle_count} particles on {args.device}")
+    show_grid = not args.hide_grid
+    app = NewtonAPICTest(
+        device=args.device,
+        res=args.res,
+        voxel_size=args.voxel_size,
+        show_grid=show_grid,
+    )
+    if args.no_projection:
+        app.enable_projection = False
+        app.solver.config.enable_projection = False
+    print(
+        f"APIC demo: {app.particle_count} particles on {args.device} "
+        f"(show_grid={show_grid}, projection={app.solver.config.enable_projection})"
+    )
 
     if args.no_viewer:
         n_frames = args.frames if args.frames > 0 else 30
@@ -165,9 +297,13 @@ def main():
             app.step()
             if (i + 1) % 10 == 0:
                 q = app.state_0.particle_q.numpy()
+                starts, _ends = app.solver.get_grid_wireframe()
+                edge_count = 0 if starts is None else int(starts.shape[0])
                 print(
                     f"frame {i + 1}/{n_frames}  z_mean={q[:, 2].mean():.4f}  "
-                    f"z_min={q[:, 2].min():.4f}  finite={np.isfinite(q).all()}"
+                    f"z_min={q[:, 2].min():.4f}  z_span={q[:, 2].max() - q[:, 2].min():.4f}  "
+                    f"grid_edges={edge_count}  proj_iters={app.solver.last_projection_iters}  "
+                    f"finite={np.isfinite(q).all()}"
                 )
         print("Headless APIC run finished.")
         return

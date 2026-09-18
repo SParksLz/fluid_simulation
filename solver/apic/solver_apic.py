@@ -1,18 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Classic APIC skeleton on warp.fem.Nanogrid (no pressure projection)."""
+"""APIC fluid on warp.fem.Nanogrid with optional pressure projection."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import warp as wp
+import warp.examples.fem.utils as fem_example_utils
 import warp.fem as fem
-from warp.fem import Domain, Field, Sample, at_node, grad, integrand
-from warp.sparse import bsr_mv
+from warp.fem import Domain, Field, Sample, at_node, div, grad, integrand
+from warp.sparse import BsrMatrix, bsr_mm, bsr_mv, bsr_transposed
 
 import newton
 from newton import ParticleFlags
@@ -94,6 +96,67 @@ def velocity_boundary_projector_form(
 
 
 @integrand
+def divergence_form(s: Sample, domain: Domain, u: Field, psi: Field):
+    return div(u, s) * psi(s)
+
+
+@wp.kernel
+def scale_transposed_divergence_mat(
+    tr_divergence_mat_offsets: wp.array(dtype=int),
+    tr_divergence_mat_values: wp.array(dtype=Any),
+    inv_fraction_int: wp.array(dtype=float),
+):
+    u_i = wp.tid()
+    block_beg = tr_divergence_mat_offsets[u_i]
+    block_end = tr_divergence_mat_offsets[u_i + 1]
+    for b in range(block_beg, block_end):
+        tr_divergence_mat_values[b] = tr_divergence_mat_values[b] * inv_fraction_int[u_i]
+
+
+def solve_incompressibility(
+    divergence_mat: BsrMatrix,
+    dirichlet_projector: BsrMatrix,
+    inv_volume: wp.array,
+    pressure: wp.array,
+    velocity: wp.array,
+    quiet: bool = True,
+    tol: float = 1.0e-5,
+    max_iters: int = 200,
+) -> tuple[float, int]:
+    """Project grid velocity to a (approximately) divergence-free field."""
+    rhs = wp.empty_like(pressure)
+    bsr_mv(A=divergence_mat, x=velocity, y=rhs, alpha=-1.0)
+
+    bsr_mm(alpha=-1.0, x=divergence_mat, y=dirichlet_projector, z=divergence_mat, beta=1.0)
+
+    transposed_divergence_mat = bsr_transposed(divergence_mat)
+    wp.launch(
+        kernel=scale_transposed_divergence_mat,
+        dim=inv_volume.shape[0],
+        inputs=[
+            transposed_divergence_mat.offsets,
+            transposed_divergence_mat.values,
+            inv_volume,
+        ],
+        device=inv_volume.device,
+    )
+
+    schur = bsr_mm(divergence_mat, transposed_divergence_mat)
+    residual, iters = fem_example_utils.bsr_cg(
+        schur,
+        b=rhs,
+        x=pressure,
+        quiet=quiet,
+        tol=tol,
+        method="cr",
+        max_iters=max_iters,
+    )
+
+    bsr_mv(A=transposed_divergence_mat, x=pressure, y=velocity, alpha=1.0, beta=1.0)
+    return float(residual), int(iters)
+
+
+@integrand
 def update_particles(
     s: Sample,
     domain: Domain,
@@ -161,6 +224,63 @@ def copy_particle_state(
         pass
 
 
+@wp.func
+def _voxel_corner(volume: wp.uint64, ijk: wp.vec3i, ox: int, oy: int, oz: int):
+    return wp.volume_index_to_world(
+        volume,
+        wp.vec3(float(ijk[0] + ox), float(ijk[1] + oy), float(ijk[2] + oz)),
+    )
+
+
+@wp.kernel
+def build_voxel_wireframe_edges(
+    volume: wp.uint64,
+    voxels: wp.array(dtype=wp.vec3i),
+    starts: wp.array(dtype=wp.vec3),
+    ends: wp.array(dtype=wp.vec3),
+):
+    """Emit 12 cube edges per allocated Nanogrid voxel."""
+    tid = wp.tid()
+    ijk = voxels[tid]
+    c000 = _voxel_corner(volume, ijk, 0, 0, 0)
+    c100 = _voxel_corner(volume, ijk, 1, 0, 0)
+    c010 = _voxel_corner(volume, ijk, 0, 1, 0)
+    c110 = _voxel_corner(volume, ijk, 1, 1, 0)
+    c001 = _voxel_corner(volume, ijk, 0, 0, 1)
+    c101 = _voxel_corner(volume, ijk, 1, 0, 1)
+    c011 = _voxel_corner(volume, ijk, 0, 1, 1)
+    c111 = _voxel_corner(volume, ijk, 1, 1, 1)
+
+    base = tid * 12
+    # bottom face
+    starts[base + 0] = c000
+    ends[base + 0] = c100
+    starts[base + 1] = c100
+    ends[base + 1] = c110
+    starts[base + 2] = c110
+    ends[base + 2] = c010
+    starts[base + 3] = c010
+    ends[base + 3] = c000
+    # top face
+    starts[base + 4] = c001
+    ends[base + 4] = c101
+    starts[base + 5] = c101
+    ends[base + 5] = c111
+    starts[base + 6] = c111
+    ends[base + 6] = c011
+    starts[base + 7] = c011
+    ends[base + 7] = c001
+    # vertical edges
+    starts[base + 8] = c000
+    ends[base + 8] = c001
+    starts[base + 9] = c100
+    ends[base + 9] = c101
+    starts[base + 10] = c110
+    ends[base + 10] = c111
+    starts[base + 11] = c010
+    ends[base + 11] = c011
+
+
 class SolverAPIC(SolverBase):
     @dataclass
     class Config:
@@ -171,6 +291,10 @@ class SolverAPIC(SolverBase):
         clamp_eps: float = 1.0e-4
         mass_epsilon: float = 1.0e-8
         grid_capacity_ratio: float = 16.0
+        enable_projection: bool = True
+        projection_tol: float = 1.0e-5
+        projection_max_iters: int = 200
+        projection_quiet: bool = True
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -216,13 +340,52 @@ class SolverAPIC(SolverBase):
         self._linear_basis_space = None
         self._velocity_space = None
         self._fraction_space = None
+        self._strain_space = None
         self._bound_lo = wp.vec3(*config.bound_lo)
         self._bound_hi = wp.vec3(*config.bound_hi)
         self._bsr_options = {"construction": "row_compress", "capacity": "auto"}
         self._initialized = False
+        self._viz_edge_starts: wp.array | None = None
+        self._viz_edge_ends: wp.array | None = None
+        self._viz_edge_capacity = 0
+        self.last_projection_residual = 0.0
+        self.last_projection_iters = 0
 
         if model.particle_count > 0:
             self._ensure_grid(model.state().particle_q)
+
+    def get_grid_wireframe(self) -> tuple[wp.array, wp.array] | tuple[None, None]:
+        """Return line-segment endpoints for the current Nanogrid voxels.
+
+        Each allocated voxel contributes 12 cube edges. Arrays are on the model device.
+        """
+        if self._volume is None:
+            return None, None
+
+        voxels_raw = self._volume.get_voxels()
+        if voxels_raw is None or int(voxels_raw.shape[0]) == 0:
+            return None, None
+
+        voxel_count = int(voxels_raw.shape[0])
+        if voxels_raw.dtype == wp.vec3i:
+            voxels = voxels_raw
+        else:
+            voxels_np = voxels_raw.numpy().reshape((-1, 3)).astype(np.int32, copy=False)
+            voxels = wp.array(voxels_np, dtype=wp.vec3i, device=self.model.device)
+
+        edge_count = voxel_count * 12
+        if self._viz_edge_capacity != edge_count:
+            self._viz_edge_starts = wp.empty(edge_count, dtype=wp.vec3, device=self.model.device)
+            self._viz_edge_ends = wp.empty(edge_count, dtype=wp.vec3, device=self.model.device)
+            self._viz_edge_capacity = edge_count
+
+        wp.launch(
+            kernel=build_voxel_wireframe_edges,
+            dim=voxel_count,
+            inputs=[self._volume.id, voxels, self._viz_edge_starts, self._viz_edge_ends],
+            device=self.model.device,
+        )
+        return self._viz_edge_starts, self._viz_edge_ends
 
     def _estimate_grid_capacity(self, positions: wp.array) -> dict[str, int]:
         ratio = float(self.config.grid_capacity_ratio)
@@ -268,6 +431,12 @@ class SolverAPIC(SolverBase):
         self._linear_basis_space = fem.make_polynomial_basis_space(self._grid, degree=1)
         self._velocity_space = fem.make_collocated_function_space(self._linear_basis_space, dtype=wp.vec3)
         self._fraction_space = fem.make_collocated_function_space(self._linear_basis_space, dtype=float)
+        self._strain_space = fem.make_polynomial_space(
+            self._grid,
+            dtype=float,
+            degree=0,
+            discontinuous=True,
+        )
         self._initialized = True
 
     def _copy_passthrough_state(self, state_in: newton.State, state_out: newton.State) -> None:
@@ -303,6 +472,7 @@ class SolverAPIC(SolverBase):
             # Rebuild sparse grid around current particles.
             self._grid.rebuild(state_in.particle_q, status=self._grid_status)
             self._linear_basis_space.topology.rebuild()
+            self._strain_space.topology.rebuild()
 
             whole_domain = fem.Cells(self._grid)
             pic = fem.PicQuadrature(
@@ -331,8 +501,20 @@ class SolverAPIC(SolverBase):
                 max_node_count=self._grid.vertex_count(),
                 temporary_store=self.temporary_store,
             )
+            strain_partition = fem.make_space_partition(
+                self._strain_space.topology,
+                geometry_partition=geo_partition,
+                with_halo=False,
+                max_node_count=self._grid.cell_count(),
+                temporary_store=self.temporary_store,
+            )
             velocity_restriction = fem.make_space_restriction(
                 space_partition=velocity_partition,
+                domain=domain,
+                temporary_store=self.temporary_store,
+            )
+            strain_restriction = fem.make_space_restriction(
+                space_partition=strain_partition,
                 domain=domain,
                 temporary_store=self.temporary_store,
             )
@@ -340,7 +522,9 @@ class SolverAPIC(SolverBase):
             velocity_test = fem.make_test(self._velocity_space, space_restriction=velocity_restriction)
             velocity_trial = fem.make_trial(self._velocity_space, space_restriction=velocity_restriction)
             fraction_test = fem.make_test(self._fraction_space, space_restriction=velocity_restriction)
+            strain_test = fem.make_test(self._strain_space, space_restriction=strain_restriction)
             velocity_field = self._velocity_space.make_field(velocity_partition)
+            pressure_field = self._strain_space.make_field(strain_partition)
 
             vel_projector = fem.integrate(
                 velocity_boundary_projector_form,
@@ -396,7 +580,29 @@ class SolverAPIC(SolverBase):
                 beta=1.0,
             )
 
-            # Future: pressure projection goes here (after BC, before G2P).
+            self.last_projection_residual = 0.0
+            self.last_projection_iters = 0
+            if self.config.enable_projection:
+                divergence_matrix = fem.integrate(
+                    divergence_form,
+                    quadrature=pic,
+                    fields={"u": velocity_trial, "psi": strain_test},
+                    output_dtype=float,
+                    bsr_options=self._bsr_options,
+                    temporary_store=self.temporary_store,
+                )
+                residual, iters = solve_incompressibility(
+                    divergence_matrix,
+                    vel_projector,
+                    inv_volume,
+                    pressure_field.dof_values,
+                    velocity_field.dof_values,
+                    quiet=bool(self.config.projection_quiet),
+                    tol=float(self.config.projection_tol),
+                    max_iters=int(self.config.projection_max_iters),
+                )
+                self.last_projection_residual = residual
+                self.last_projection_iters = iters
 
             # Write outputs: start from inputs then overwrite active particles via G2P.
             wp.launch(
