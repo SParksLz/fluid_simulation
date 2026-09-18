@@ -22,23 +22,51 @@ from newton.solvers import SolverBase
 
 
 @wp.func
-def box_container_sdf(x: wp.vec3, lo: wp.vec3, hi: wp.vec3):
-    """Positive inside the box, negative outside. Normal points into the wall."""
-    dx = wp.min(x[0] - lo[0], hi[0] - x[0])
-    dy = wp.min(x[1] - lo[1], hi[1] - x[1])
-    dz = wp.min(x[2] - lo[2], hi[2] - x[2])
-    sdf = wp.min(dx, wp.min(dy, dz))
+def apply_box_free_slip(
+    x: wp.vec3,
+    vel: wp.vec3,
+    lo: wp.vec3,
+    hi: wp.vec3,
+    band: float,
+    friction: float,
+):
+    """Axis-separated free-slip for AABB, including edges/corners.
 
-    if dx <= dy and dx <= dz:
-        nx = wp.where(x[0] - lo[0] < hi[0] - x[0], -1.0, 1.0)
-        n = wp.vec3(nx, 0.0, 0.0)
-    elif dy <= dz:
-        ny = wp.where(x[1] - lo[1] < hi[1] - x[1], -1.0, 1.0)
-        n = wp.vec3(0.0, ny, 0.0)
-    else:
-        nz = wp.where(x[2] - lo[2] < hi[2] - x[2], -1.0, 1.0)
-        n = wp.vec3(0.0, 0.0, nz)
-    return sdf, n
+    Removes the into-wall velocity component for every nearby face, and optionally
+    damps tangential speed to reduce corner accumulation.
+    """
+    v = vel
+    contacted = int(0)
+
+    if x[0] <= lo[0] + band:
+        if v[0] < 0.0:
+            v = wp.vec3(0.0, v[1], v[2])
+        contacted = 1
+    if x[0] >= hi[0] - band:
+        if v[0] > 0.0:
+            v = wp.vec3(0.0, v[1], v[2])
+        contacted = 1
+    if x[1] <= lo[1] + band:
+        if v[1] < 0.0:
+            v = wp.vec3(v[0], 0.0, v[2])
+        contacted = 1
+    if x[1] >= hi[1] - band:
+        if v[1] > 0.0:
+            v = wp.vec3(v[0], 0.0, v[2])
+        contacted = 1
+    if x[2] <= lo[2] + band:
+        if v[2] < 0.0:
+            v = wp.vec3(v[0], v[1], 0.0)
+        contacted = 1
+    if x[2] >= hi[2] - band:
+        if v[2] > 0.0:
+            v = wp.vec3(v[0], v[1], 0.0)
+        contacted = 1
+
+    if contacted != 0 and friction > 0.0:
+        keep = wp.max(0.0, 1.0 - friction)
+        v = v * keep
+    return v
 
 
 @integrand
@@ -58,9 +86,11 @@ def integrate_velocity(
     particle_world: wp.array(dtype=wp.int32),
     bound_lo: wp.vec3,
     bound_hi: wp.vec3,
+    wall_band: float,
+    wall_friction: float,
     dt: float,
 ):
-    """APIC P2G with gravity and free-slip against the box exterior."""
+    """APIC P2G with gravity and AABB free-slip."""
     pid = s.qp_index
     if (particle_flags[pid] & ParticleFlags.ACTIVE) == 0:
         return 0.0
@@ -70,12 +100,8 @@ def integrate_velocity(
 
     world_idx = wp.max(particle_world[pid], 0)
     vel_adv = vel_apic + dt * gravity[world_idx]
-
-    sdf, sdf_gradient = box_container_sdf(domain(s), bound_lo, bound_hi)
-    if sdf <= 0.0:
-        v_n = wp.dot(vel_adv, sdf_gradient)
-        vel_adv -= wp.max(v_n, 0.0) * sdf_gradient
-
+    x = domain(s)
+    vel_adv = apply_box_free_slip(x, vel_adv, bound_lo, bound_hi, wall_band, wall_friction)
     return wp.dot(u(s), vel_adv)
 
 
@@ -87,12 +113,20 @@ def velocity_boundary_projector_form(
     v: Field,
     bound_lo: wp.vec3,
     bound_hi: wp.vec3,
+    wall_band: float,
 ):
+    """Separable AABB free-slip projector (valid on faces, edges, and corners)."""
     x = domain(s)
-    sdf, sdf_normal = box_container_sdf(x, bound_lo, bound_hi)
-    if sdf > 0.0:
-        return 0.0
-    return wp.dot(u(s), sdf_normal) * wp.dot(v(s), sdf_normal)
+    uv = u(s)
+    vv = v(s)
+    out = float(0.0)
+    if x[0] <= bound_lo[0] + wall_band or x[0] >= bound_hi[0] - wall_band:
+        out += uv[0] * vv[0]
+    if x[1] <= bound_lo[1] + wall_band or x[1] >= bound_hi[1] - wall_band:
+        out += uv[1] * vv[1]
+    if x[2] <= bound_lo[2] + wall_band or x[2] >= bound_hi[2] - wall_band:
+        out += uv[2] * vv[2]
+    return out
 
 
 @integrand
@@ -165,13 +199,14 @@ def update_particles(
     bound_lo: wp.vec3,
     bound_hi: wp.vec3,
     clamp_eps: float,
+    wall_friction: float,
     particle_flags: wp.array(dtype=wp.int32),
     pos: wp.array(dtype=wp.vec3),
     pos_prev: wp.array(dtype=wp.vec3),
     vel: wp.array(dtype=wp.vec3),
     vel_grad: wp.array(dtype=wp.mat33),
 ):
-    """G2P + advect + box clamp."""
+    """G2P + advect + axis-separated wall response (no single-normal corner bug)."""
     pid = s.qp_index
     if (particle_flags[pid] & ParticleFlags.ACTIVE) == 0:
         pos[pid] = pos_prev[pid]
@@ -183,7 +218,51 @@ def update_particles(
     pos_adv = pos_prev[pid] + dt * p_vel
     lo = bound_lo + wp.vec3(clamp_eps, clamp_eps, clamp_eps)
     hi = bound_hi - wp.vec3(clamp_eps, clamp_eps, clamp_eps)
-    pos_adv = wp.min(wp.max(pos_adv, lo), hi)
+
+    # Component-wise clamp + kill into-wall velocity for every violated face.
+    vx = p_vel[0]
+    vy = p_vel[1]
+    vz = p_vel[2]
+    contacted = int(0)
+
+    if pos_adv[0] < lo[0]:
+        pos_adv = wp.vec3(lo[0], pos_adv[1], pos_adv[2])
+        if vx < 0.0:
+            vx = 0.0
+        contacted = 1
+    elif pos_adv[0] > hi[0]:
+        pos_adv = wp.vec3(hi[0], pos_adv[1], pos_adv[2])
+        if vx > 0.0:
+            vx = 0.0
+        contacted = 1
+
+    if pos_adv[1] < lo[1]:
+        pos_adv = wp.vec3(pos_adv[0], lo[1], pos_adv[2])
+        if vy < 0.0:
+            vy = 0.0
+        contacted = 1
+    elif pos_adv[1] > hi[1]:
+        pos_adv = wp.vec3(pos_adv[0], hi[1], pos_adv[2])
+        if vy > 0.0:
+            vy = 0.0
+        contacted = 1
+
+    if pos_adv[2] < lo[2]:
+        pos_adv = wp.vec3(pos_adv[0], pos_adv[1], lo[2])
+        if vz < 0.0:
+            vz = 0.0
+        contacted = 1
+    elif pos_adv[2] > hi[2]:
+        pos_adv = wp.vec3(pos_adv[0], pos_adv[1], hi[2])
+        if vz > 0.0:
+            vz = 0.0
+        contacted = 1
+
+    p_vel = wp.vec3(vx, vy, vz)
+    if contacted != 0 and wall_friction > 0.0:
+        keep = wp.max(0.0, 1.0 - wall_friction)
+        p_vel = p_vel * keep
+        vel_grad[pid] = vel_grad[pid] * keep
 
     pos[pid] = pos_adv
     vel[pid] = p_vel
@@ -330,6 +409,8 @@ class SolverAPIC(SolverBase):
         bound_lo: tuple[float, float, float] = (-1.0, -1.0, 0.0)
         bound_hi: tuple[float, float, float] = (1.0, 1.0, 2.0)
         clamp_eps: float = 1.0e-4
+        wall_band: float = -1.0  # <0 => 0.75 * voxel_size
+        wall_friction: float = 0.15
         mass_epsilon: float = 1.0e-8
         grid_capacity_ratio: float = 16.0
         enable_projection: bool = True
@@ -388,6 +469,11 @@ class SolverAPIC(SolverBase):
         self._strain_space = None
         self._bound_lo = wp.vec3(*config.bound_lo)
         self._bound_hi = wp.vec3(*config.bound_hi)
+        if float(config.wall_band) >= 0.0:
+            self._wall_band = float(config.wall_band)
+        else:
+            self._wall_band = 0.75 * float(config.voxel_size)
+        self._wall_friction = float(config.wall_friction)
         self._bsr_options = {"construction": "row_compress", "capacity": "auto"}
         self._initialized = False
         self._viz_edge_starts: wp.array | None = None
@@ -574,7 +660,11 @@ class SolverAPIC(SolverBase):
             vel_projector = fem.integrate(
                 velocity_boundary_projector_form,
                 fields={"u": velocity_trial, "v": velocity_test},
-                values={"bound_lo": self._bound_lo, "bound_hi": self._bound_hi},
+                values={
+                    "bound_lo": self._bound_lo,
+                    "bound_hi": self._bound_hi,
+                    "wall_band": float(self._wall_band),
+                },
                 assembly="nodal",
                 output_dtype=float,
                 bsr_options=self._bsr_options,
@@ -604,6 +694,8 @@ class SolverAPIC(SolverBase):
                     "particle_world": particle_world,
                     "bound_lo": self._bound_lo,
                     "bound_hi": self._bound_hi,
+                    "wall_band": float(self._wall_band),
+                    "wall_friction": float(self._wall_friction),
                     "dt": float(dt),
                 },
                 output_dtype=wp.vec3,
@@ -677,6 +769,7 @@ class SolverAPIC(SolverBase):
                     "bound_lo": self._bound_lo,
                     "bound_hi": self._bound_hi,
                     "clamp_eps": float(self.config.clamp_eps),
+                    "wall_friction": float(self._wall_friction),
                     "particle_flags": model.particle_flags,
                 },
                 fields={"grid_vel": velocity_field},
