@@ -50,7 +50,7 @@ class NewtonAPICTest:
     def __init__(
         self,
         device: str = "cuda:0",
-        res: int = 12,
+        res: int = 20,
         voxel_size: float | None = None,
         show_grid: bool = True,
     ) -> None:
@@ -187,6 +187,11 @@ class NewtonAPICTest:
                     f"Projection iters: {self.solver.last_projection_iters}  "
                     f"residual: {self.solver.last_projection_residual:.3e}"
                 )
+                imgui.text(
+                    f"C damp={self.solver.config.c_damping:.2f}  "
+                    f"|C|max={self.solver.config.c_norm_max:.1f}  "
+                    f"vmax={self.solver.config.max_particle_speed:.1f}"
+                )
 
     def render(self) -> None:
         if self.viewer is None:
@@ -266,7 +271,7 @@ class NewtonAPICTest:
 def main():
     parser = argparse.ArgumentParser(description="Newton APIC skeleton demo")
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--res", type=int, default=12, help="Particles per axis of the initial block")
+    parser.add_argument("--res", type=int, default=20, help="Particles per axis of the initial block (20^3=8000)")
     parser.add_argument("--voxel-size", type=float, default=None)
     parser.add_argument("--frames", type=int, default=6000, help="Max frames for viewer; used by --no-viewer too")
     parser.add_argument("--no-viewer", action="store_true", help="Headless smoke run")

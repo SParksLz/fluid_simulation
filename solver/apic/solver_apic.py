@@ -190,6 +190,47 @@ def update_particles(
 
 
 @wp.kernel
+def stabilize_affine_C(
+    flags: wp.array(dtype=wp.int32),
+    C: wp.array(dtype=wp.mat33),
+    damping: float,
+    max_norm: float,
+):
+    """Damp and Frobenius-clamp APIC affine matrices to limit splash blow-up."""
+    i = wp.tid()
+    if (flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    c = C[i] * damping
+    n2 = float(0.0)
+    for r in range(3):
+        for col in range(3):
+            v = c[r, col]
+            n2 += v * v
+    n = wp.sqrt(n2)
+    if max_norm > 0.0 and n > max_norm and n > 0.0:
+        c = c * (max_norm / n)
+    C[i] = c
+
+
+@wp.kernel
+def clamp_particle_speed(
+    flags: wp.array(dtype=wp.int32),
+    qd: wp.array(dtype=wp.vec3),
+    max_speed: float,
+):
+    i = wp.tid()
+    if (flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if max_speed <= 0.0:
+        return
+    v = qd[i]
+    speed = wp.length(v)
+    if speed > max_speed:
+        qd[i] = v * (max_speed / speed)
+
+
+@wp.kernel
 def invert_volume_kernel(values: wp.array(dtype=float)):
     i = wp.tid()
     m = values[i]
@@ -295,6 +336,10 @@ class SolverAPIC(SolverBase):
         projection_tol: float = 1.0e-5
         projection_max_iters: int = 200
         projection_quiet: bool = True
+        # Stabilize APIC affine blow-up after impacts / free-surface contact.
+        c_damping: float = 0.92
+        c_norm_max: float = 25.0
+        max_particle_speed: float = 8.0
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -637,5 +682,28 @@ class SolverAPIC(SolverBase):
                 fields={"grid_vel": velocity_field},
                 temporary_store=self.temporary_store,
             )
+
+            wp.launch(
+                kernel=stabilize_affine_C,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_flags,
+                    state_out.apic.C,
+                    float(self.config.c_damping),
+                    float(self.config.c_norm_max),
+                ],
+                device=model.device,
+            )
+            if float(self.config.max_particle_speed) > 0.0:
+                wp.launch(
+                    kernel=clamp_particle_speed,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_flags,
+                        state_out.particle_qd,
+                        float(self.config.max_particle_speed),
+                    ],
+                    device=model.device,
+                )
         finally:
             fem.set_default_temporary_store(None)
