@@ -1,0 +1,8 @@
+# Documented dependency set, checked on 2026-09-28.
+# Newton 1.6.0 provides ParticleSurface and requires Warp >=1.17.0.
+newton==1.6.0
+warp-lang==1.17.0
+numpy==2.4.3
+usd-core==26.8
+pyglet==2.1.16
+imgui-bundle==1.92.801
