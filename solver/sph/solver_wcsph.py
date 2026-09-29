@@ -126,6 +126,7 @@ def compute_density_pressure(
     particle_volume: wp.array(dtype=float),
     smoothing_length: float,
     grid_id: wp.uint64,
+    clamp_negative_pressure: bool,
     rho: wp.array(dtype=float),
     pressure: wp.array(dtype=float),
 ):
@@ -149,7 +150,12 @@ def compute_density_pressure(
 
     rho_i = rho_temp
     rho[i] = rho_i
-    pressure[i] = stiffness[i] * (wp.pow(rho_i / wp.max(rest_density[i], 1.0e-6), exponent[i]) - 1.0)
+    p = stiffness[i] * (wp.pow(rho_i / wp.max(rest_density[i], 1.0e-6), exponent[i]) - 1.0)
+    # In a single-phase free-surface simulation, incomplete kernel support must
+    # not create tensile pressure. Atmospheric pressure is the zero reference.
+    if clamp_negative_pressure:
+        p = wp.max(p, 0.0)
+    pressure[i] = p
 
 
 @wp.kernel
@@ -309,6 +315,7 @@ class SolverWCSPH(SolverBase):
         bound_height: float = 10.0
         bound_length: float = 10.0
         boundary_damping: float = -0.1
+        clamp_negative_pressure: bool = True
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -460,6 +467,7 @@ class SolverWCSPH(SolverBase):
                 self._particle_volume,
                 smoothing_length,
                 model.particle_grid.id,
+                self.config.clamp_negative_pressure,
             ],
             outputs=[state_out.sph.rho, state_out.sph.pressure],
             device=model.device,

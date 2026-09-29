@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 if wp is not None:
-    from wcsph_kernel import (  # noqa: E402
+    from backup.examples.wcsph_kernel import (  # noqa: E402
         acceleration_non_pressure,
         apply_divergence_free_correction,
         apply_constant_density_correction,

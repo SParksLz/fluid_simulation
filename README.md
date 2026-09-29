@@ -33,6 +33,8 @@ APIC transfers particle velocities to the grid, applies gravity and box boundary
 
 The documented setup uses **Python 3.13.5, Newton 1.6.0, and Warp 1.17.0**. Newton/Warp were checked in an isolated installation on **2026-09-28**; the remaining package versions and hardware below come from the development machine. This is a reproducibility reference, rather than a claim that every simulation has been fully validated.
 
+The shared dam-break examples were also checked with **Python 3.12.13, Newton 1.6.0, and Warp 1.17.0** on 2026-09-29. See the [example guide](examples/dam_break/README.md) for the checks and parameter settings.
+
 | Component | Version / configuration |
 | --- | --- |
 | OS | Ubuntu 24.04.1 LTS, x86_64 |
@@ -51,9 +53,9 @@ CUDA values above describe the Warp runtime and driver, not a required local `nv
 
 ### APIC demo compatibility
 
-`newton_apic_test.py` requires `newton.geometry.ParticleSurface`, introduced in **Newton 1.6.0**. Newton 1.6.0 also requires **`warp-lang>=1.17.0`**; the pinned setup uses Warp 1.17.0. See the [Newton 1.6.0 release notes](https://github.com/newton-physics/newton/releases/tag/v1.6.0) and [ParticleSurface API](https://newton-physics.github.io/newton/1.6.0/api/_generated/newton.geometry.ParticleSurface.html).
+Surface reconstruction requires `newton.geometry.ParticleSurface`, introduced in **Newton 1.6.0**. Newton 1.6.0 also requires **`warp-lang>=1.17.0`**; the pinned setup uses Warp 1.17.0. See the [Newton 1.6.0 release notes](https://github.com/newton-physics/newton/releases/tag/v1.6.0) and [ParticleSurface API](https://newton-physics.github.io/newton/1.6.0/api/_generated/newton.geometry.ParticleSurface.html).
 
-All four Newton demo command-line entry points import successfully with Newton 1.6.0 and Warp 1.17.0. Older Newton builds such as 1.5.0 fail to import the APIC demo, even with `--no-surface` or `--no-viewer`, because `ParticleSurface` is imported at startup.
+The four shared examples and archived Newton entry points use the documented Newton 1.6.0 / Warp 1.17.0 environment. The [archived APIC viewer](backup/examples/newton_apic_test.py) imports `ParticleSurface` at startup, so it also requires Newton 1.6.0 when surface display is disabled.
 
 ## Installation
 
@@ -79,60 +81,59 @@ python -c "from importlib.metadata import version; print('Newton:', version('new
 
 ## Running the examples
 
-Run commands from the repository root. `--frames` controls the number of rendered frames; `--device` selects the Warp device.
+Run commands from the repository root. `--device` selects the Warp device.
 
-### Newton WCSPH, DFSPH, and PBF
+### Shared dam-break examples
 
-These examples load `temp/fluid_particles.usd` by default. That scene is included in the repository. A custom scene must contain a `UsdGeom.Points` prim at `/Fluid/Particles` with `points` and `widths` attributes.
-
-```bash
-python newton_tank_test.py --device cuda:0 --frames 600 --color-field pressure
-python newton_dfsph_test.py --device cuda:0 --frames 600 --color-field kappa_v
-python newton_pbf_test.py --device cuda:0 --frames 600 --color-field rho
-```
-
-Use `--usd path/to/scene.usd` to load another particle scene. The WCSPH and DFSPH examples scale input positions by 100 and convert them back for display; the PBF example uses input positions directly and configures its bounds from the scene. Account for this difference when sharing scenes or comparing parameters.
-
-### APIC wave tank
-
-APIC generates its water column procedurally and does not need an input USD scene. Use Newton 1.6.0 and Warp 1.17.0 as described above.
+The examples in [`examples/dam_break/`](examples/dam_break/README.md) use the same APIC water column for **APIC, WCSPH, DFSPH, and PBF**: tank bounds `(-1.2, -0.28, 0)` to `(1.2, 0.28, 1.2)` meters, target 400,000 particles (401,856 actual), identical particle mass/radius/positions, zero initial velocity, and gravity `(0, 0, -10)`. All use meters directly, advance complete 1/60-second frames, and share the APIC surface reconstruction and camera settings. Solver-specific numerical settings remain distinct.
 
 ```bash
-# OpenGL wave tank with surface reconstruction
-python newton_apic_test.py --device cuda:0 --particles 100000 --frames 600
+python examples/dam_break/apic.py
+python examples/dam_break/wcsph.py
+python examples/dam_break/dfsph.py
+python examples/dam_break/pbf.py
 
-# Headless particle simulation without surface extraction
-python newton_apic_test.py --device cuda:0 --particles 10000 --frames 30 --no-viewer --no-surface
+# Headless surface USD animation, with the same options for each solver
+python examples/dam_break/apic.py --frames 300 --no-viewer --usd-every 2 \
+  --usd examples/dam_break/output/apic/surface.usdc
 
-# Record a USD clip
-python newton_apic_test.py --device cuda:0 --particles 100000 --viewer usd --frames 120 --output-path apic_wave_tank.usdc
+# Small headless particle simulation
+python examples/dam_break/dfsph.py --particles 10000 --frames 60 --no-viewer --no-surface
+
+# WCSPH particles with extra numerical damping
+python examples/dam_break/wcsph.py --no-surface --wcsph-viscosity 5e-4
 ```
 
-Useful options include `--show-grid`, `--show-particles`, `--no-projection`, `--voxel-size`, and `--surface-voxel-size`. The default target particle count is 400,000; actual counts depend on the generated lattice. The demo uses four simulation substeps per 1/60-second frame. Use `python newton_apic_test.py --help` for the full option list.
+Default duration is 300 frames (5 seconds). Each run records scene specifications, an initial-position hash, solver settings, environment, and metrics under `examples/dam_break/output/<solver>/`. See the [dam-break guide](examples/dam_break/README.md) for particle-only USD export and surface options. **APIC and DFSPH remain under development.**
 
-### Original Warp experiments
+### Archived examples
 
-`tank_test.py` and `suction_test.py` are standalone experiments using `wcsph_kernel.py`, separate from the Newton solver wrappers. `tank_test.py` currently selects its DFSPH path in the main block. `suction_test.py` expects `temp/fluid_suction_scene.usd`, which is not included; it requires a scene with the dropper/container data used by its loader.
+The earlier root-level examples are now in [`backup/examples/`](backup/examples/README.md), including the four Newton entry points, the standalone tank/suction experiments, and their `wcsph_kernel.py`. Their default input paths still resolve to the repository's `temp/` directory. See the [archive guide](backup/examples/README.md) for the original commands and coordinate conventions.
+
+For example, the earlier APIC viewer is available with `python backup/examples/newton_apic_test.py --help`.
 
 ## Tests
 
-Run the included APIC tests and the original DFSPH kernel tests without installing pytest:
+Run the APIC, original DFSPH kernel, and shared dam-break tests without installing pytest:
 
 ```bash
 python -m unit_test.unit_test_apic
 python -m unittest discover -s unit_test -p 'unit_test_dfsph.py' -v
+python -m unittest unit_test.unit_test_dam_break -v
 ```
 
-Both suites select CUDA when available. On Linux, force CPU for small smoke tests with:
+The APIC and original DFSPH suites select CUDA when available; the shared dam-break checks use CPU. On Linux, force CPU for small smoke tests with:
 
 ```bash
 CUDA_VISIBLE_DEVICES="" python -m unit_test.unit_test_apic
 CUDA_VISIBLE_DEVICES="" python -m unittest discover -s unit_test -p 'unit_test_dfsph.py' -v
 ```
 
-The APIC suite covers custom attributes, falling particles within a box, and a projection/thickness check. The DFSPH suite exercises the kernels in `wcsph_kernel.py`, rather than the Newton `SolverDFSPH` wrapper.
+The APIC suite covers custom attributes, falling particles within a box, and a projection/thickness check. The DFSPH suite exercises the kernels in `backup/examples/wcsph_kernel.py`. The shared dam-break suite checks common particle specifications, complete frame advancement, theoretical height guides, and WCSPH pressure/timestep behavior.
 
 On 2026-09-28, the documented Python/Newton/Warp combination passed all three APIC CPU tests, both original DFSPH CPU tests, and the `--help` import checks for all four Newton demos. These checks do not establish accuracy or stability for full-size GPU simulations.
+
+After archiving the earlier entry points on 2026-09-29, all **15 CPU checks** and the `--help` checks for the four shared and four archived Newton entry points passed in the Python 3.12.13 / Newton 1.6.0 / Warp 1.17.0 environment.
 
 ## Repository layout
 
@@ -142,12 +143,10 @@ solver/
   sph/solver_wcsph.py       Newton WCSPH solver
   sph/solver_dfsph.py       Newton DFSPH solver
   pbf/solver_pbf.py         Newton PBF solver
-newton_*_test.py            Newton demo entry points
-wcsph_kernel.py             Kernels for original SPH experiments
-tank_test.py                Original tank experiment
-suction_test.py             Original suction/dropper experiment
+examples/dam_break/         Shared scene, four solver demos, surface/USD output
+backup/examples/           Earlier Newton and standalone Warp examples and kernels
 renderer/render_opengl.py   Custom Warp OpenGL renderer
-unit_test/                 Small APIC and DFSPH tests
+unit_test/                 APIC, original DFSPH, and shared dam-break checks
 temp/                      Input USD scenes and local experiment outputs
 resources/                 Demo videos and GIFs
 docs/superpowers/          Historical APIC design and implementation notes

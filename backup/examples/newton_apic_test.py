@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if __package__ in (None, ""):
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import argparse
 import os
 import warnings
@@ -29,67 +36,7 @@ import newton
 from newton.geometry import ParticleSurface
 from newton.viewer import ViewerRTX
 from solver.apic import SolverAPIC
-
-
-def spawn_particle_block(lo, hi, res, density: float = 1000.0):
-    xs = np.linspace(lo[0], hi[0], res[0])
-    ys = np.linspace(lo[1], hi[1], res[1])
-    zs = np.linspace(lo[2], hi[2], res[2])
-    xx, yy, zz = np.meshgrid(xs, ys, zs, indexing="ij")
-    positions = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=1).astype(np.float32)
-    spacing = float(
-        min(
-            (hi[0] - lo[0]) / max(res[0] - 1, 1),
-            (hi[1] - lo[1]) / max(res[1] - 1, 1),
-            (hi[2] - lo[2]) / max(res[2] - 1, 1),
-        )
-    )
-    volume = spacing**3
-    mass = density * volume
-    radius = 0.5 * spacing
-    return positions, mass, radius, volume, spacing
-
-
-def spawn_wave_tank(
-    tank_lo,
-    tank_hi,
-    target_count: int = 400000,
-    fill_x_frac: float = 0.30,
-    fill_z_frac: float = 0.70,
-    margin: float = 0.03,
-    density: float = 1000.0,
-):
-    """Rectangular tank with a water column stacked on the -X side (dam-break / wave)."""
-    tank_lo = np.asarray(tank_lo, dtype=np.float32)
-    tank_hi = np.asarray(tank_hi, dtype=np.float32)
-    extent = tank_hi - tank_lo
-
-    water_lo = np.array(
-        [
-            tank_lo[0] + margin,
-            tank_lo[1] + margin,
-            tank_lo[2] + margin,
-        ],
-        dtype=np.float32,
-    )
-    water_hi = np.array(
-        [
-            tank_lo[0] + margin + fill_x_frac * max(extent[0] - 2.0 * margin, 1.0e-3),
-            tank_hi[1] - margin,
-            tank_lo[2] + margin + fill_z_frac * max(extent[2] - 2.0 * margin, 1.0e-3),
-        ],
-        dtype=np.float32,
-    )
-    water_ext = np.maximum(water_hi - water_lo, 1.0e-3)
-    water_volume = float(np.prod(water_ext))
-    spacing = float((water_volume / max(target_count, 1)) ** (1.0 / 3.0))
-
-    res = (
-        max(2, int(round(water_ext[0] / spacing))),
-        max(2, int(round(water_ext[1] / spacing))),
-        max(2, int(round(water_ext[2] / spacing))),
-    )
-    return spawn_particle_block(tuple(water_lo), tuple(water_hi), res, density=density)
+from examples.dam_break.scene import DEFAULT_SPEC, spawn_particle_block, spawn_wave_tank
 
 
 class NewtonAPICTest:
@@ -120,16 +67,17 @@ class NewtonAPICTest:
         self.surface_triangle_count = 0
 
         # Long rectangular wave tank (X long, Y narrow, Z up).
-        self.bound_lo = (-1.20, -0.28, 0.0)
-        self.bound_hi = (1.20, 0.28, 1.20)
+        self.bound_lo = DEFAULT_SPEC.bound_lo
+        self.bound_hi = DEFAULT_SPEC.bound_hi
 
         positions, mass, radius, volume, spacing = spawn_wave_tank(
             tank_lo=self.bound_lo,
             tank_hi=self.bound_hi,
             target_count=int(particle_count),
-            fill_x_frac=0.30,
-            fill_z_frac=0.72,
-            margin=0.03,
+            fill_x_frac=DEFAULT_SPEC.fill_x_frac,
+            fill_z_frac=DEFAULT_SPEC.fill_z_frac,
+            margin=DEFAULT_SPEC.margin,
+            density=DEFAULT_SPEC.density,
         )
         self.particle_radius = radius
         self.particle_spacing = float(spacing)

@@ -1,11 +1,17 @@
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if __package__ in (None, ""):
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import warp as wp
 import warp.render
 import json
-from wcsph_kernel import *
+from backup.examples.wcsph_kernel import *
 import math
 from pxr import Usd, UsdGeom, Vt, Sdf
-from pathlib import Path
 
 class sph_material:
     def __init__(self, 
@@ -72,7 +78,7 @@ class wcsph:
         self.ghost_mass = 0.0
 
         if self.load_from_usd:
-            current_dir = Path(__file__).parent
+            current_dir = PROJECT_ROOT
             # self.load_particles_from_usd("./temp/particle_test.usd", wp.vec3(0.0, 0.0, 0.0))
             self.load_particles_from_usd((current_dir / "temp" / "fluid_suction_scene.usd").as_posix(), wp.vec3(0.0, 0.0, 0.0))
         else:

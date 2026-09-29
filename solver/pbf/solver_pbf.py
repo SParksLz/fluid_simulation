@@ -70,17 +70,20 @@ def cal_acc_with_non_pressure(
     distance: float,
     smoothing_length: float,
 ):
-    a -= gamma / mass * mass_nei * d_current_nei * get_cubic(e_dist, smoothing_length)
-    v_current_nei = wp.dot(vel - vel_nei, d_current_nei)
-    d = 10.0
-    a += (
-        d
-        * mu
-        * (mass_nei / wp.max(rho_nei, 1.0e-6))
-        * v_current_nei
-        / (distance * distance + 0.01 * (smoothing_length * smoothing_length))
-        * get_cubic_derivative(d_current_nei, smoothing_length)
-    )
+    if gamma != 0.0:
+        a -= gamma / mass * mass_nei * d_current_nei * get_cubic(e_dist, smoothing_length)
+    if mu != 0.0:
+        v_current_nei = wp.dot(vel - vel_nei, d_current_nei)
+        if v_current_nei != 0.0:
+            d = 10.0
+            a += (
+                d
+                * mu
+                * (mass_nei / wp.max(rho_nei, 1.0e-6))
+                * v_current_nei
+                / (distance * distance + 0.01 * (smoothing_length * smoothing_length))
+                * get_cubic_derivative(d_current_nei, smoothing_length)
+            )
     return a
 
 
@@ -92,7 +95,7 @@ def compute_scorr(
     scorr_n: float,
     w_delta_q: float,
 ):
-    if w_delta_q <= 1.0e-6:
+    if scorr_k == 0.0 or w_delta_q <= 1.0e-6:
         return 0.0
     ratio = get_cubic(r_norm, smoothing_length) / w_delta_q
     return -scorr_k * wp.pow(ratio, scorr_n)
@@ -332,7 +335,9 @@ def compute_delta_position(
             continue
         xij = xi - x_pred[j]
         grad = get_cubic_derivative(xij, smoothing_length)
-        scorr = compute_scorr(wp.length(xij), smoothing_length, scorr_k, scorr_n, scorr_w_delta_q)
+        scorr = float(0.0)
+        if scorr_k != 0.0:
+            scorr = compute_scorr(wp.length(xij), smoothing_length, scorr_k, scorr_n, scorr_w_delta_q)
         dp += (pbf_lambda[i] + pbf_lambda[j] + scorr) * mass[j] * grad
 
     dp = dp / rho0_i

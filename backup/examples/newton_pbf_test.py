@@ -1,7 +1,12 @@
 import argparse
 import csv
 from pathlib import Path
+import sys
 from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if __package__ in (None, ""):
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import warp as wp
@@ -101,12 +106,12 @@ class NewtonPBFTest:
         self._solver_graph_reverse = None
         self._graph_step_parity = 0
         self._graph_capture_error: str | None = None
-        self.log_path = Path(__file__).parent / "temp" / "pbf_frame_metrics.csv"
+        self.log_path = PROJECT_ROOT / "temp" / "pbf_frame_metrics.csv"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         # self._init_log_file()
 
         if usd_path is None:
-            usd_path = (Path(__file__).parent / "temp" / "fluid_particles.usd").as_posix()
+            usd_path = (PROJECT_ROOT / "temp" / "fluid_particles.usd").as_posix()
 
         if load_from_usd:
             positions, colors, particle_radius = self.load_particles_from_usd(usd_path, wp.vec3(0.0, 0.0, 0.0))

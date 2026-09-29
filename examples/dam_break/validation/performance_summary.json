@@ -1,0 +1,31 @@
+{
+  "baseline": {
+    "solve_ms": 68.31136289983988,
+    "diagnostics_ms": 6.836783845210448,
+    "upload_ms": 8.734732848824933,
+    "draw_ms": 11.944346808013506,
+    "total_ms": 95.82722640188877,
+    "fps": 10.435447602397579
+  },
+  "optimized": {
+    "solve_ms": 64.64700849610381,
+    "diagnostics_ms": 1.6689955024048686,
+    "upload_ms": 1.844785301364027,
+    "draw_ms": 12.215748557355255,
+    "total_ms": 80.37653785722796,
+    "fps": 12.44144157809198
+  },
+  "speedup": 1.1922288388696924,
+  "particles": 401856,
+  "resolution": [
+    1920,
+    1080
+  ],
+  "method": "CUDA synchronize + OpenGL glFinish; headless particle viewer",
+  "physics_agrees": true,
+  "position_max_difference": 0.0,
+  "velocity_max_difference": 0.0,
+  "density_max_difference": 0.0,
+  "ideal_flat_height_m": 0.2194114502620966,
+  "notes": "Fresh process for each display measurement; shared GPU. Earlier multi-viewer display timings excluded."
+}

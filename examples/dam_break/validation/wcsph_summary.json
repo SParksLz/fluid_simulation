@@ -1,0 +1,37 @@
+{
+  "environment": {
+    "python": "3.12.13",
+    "newton": "1.6.0",
+    "warp": "1.17.0",
+    "device": "cuda:0"
+  },
+  "validation": "401856 particles, 60 frames at 60fps; no surface or viewer",
+  "cases": [
+    {
+      "label": "default",
+      "viscosity": 1e-06,
+      "first_frame_speed": 0.1666666716337204,
+      "peak_speed": 25.66626739501953,
+      "peak_density": 1266.8004150390625,
+      "peak_compression_p99": 0.03413488769531248,
+      "final_compression_p99": 0.025404785156249998,
+      "total_substeps": 12419,
+      "elapsed_seconds": 79.49238828296075,
+      "pressure_nonnegative": true,
+      "finite": true
+    },
+    {
+      "label": "damped",
+      "viscosity": 0.0005,
+      "first_frame_speed": 0.1666666716337204,
+      "peak_speed": 15.837726593017578,
+      "peak_density": 1128.6416015625,
+      "peak_compression_p99": 0.031967285156250025,
+      "final_compression_p99": 0.007019409179687575,
+      "total_substeps": 11435,
+      "elapsed_seconds": 62.09937260096194,
+      "pressure_nonnegative": true,
+      "finite": true
+    }
+  ]
+}

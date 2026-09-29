@@ -1,13 +1,19 @@
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if __package__ in (None, ""):
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import warp as wp
 # import warp.render
 from renderer.render_opengl import CustomOpenGLRenderer
 import json
-from wcsph_kernel import *
+from backup.examples.wcsph_kernel import *
 import math
 import time
 from pxr import Usd, UsdGeom, Vt, Sdf
-from pathlib import Path
 from collections import defaultdict
 from pprint import pprint
 
@@ -154,7 +160,7 @@ class wcsph:
         # Per-substep summary diagnostics requested during DFSPH tuning.
         self.log_substep_metrics = True
         self.substep_metrics_log_enabled = True
-        self.substep_metrics_log_path = Path(__file__).parent / "temp" / "dfsph_substep_metrics.csv"
+        self.substep_metrics_log_path = PROJECT_ROOT / "temp" / "dfsph_substep_metrics.csv"
         self.log_adaptive_dt = True
         self._substep_counter = 12
         self._timing_mode_notified = False
@@ -171,7 +177,7 @@ class wcsph:
         self.collider: wp.Mesh = None
 
         if self.load_from_usd:
-            current_dir = Path(__file__).parent
+            current_dir = PROJECT_ROOT
             # self.load_particles_from_usd("./temp/particle_test.usd", wp.vec3(0.0, 0.0, 0.0))
             self.load_particles_from_usd((current_dir / "temp" / "fluid_particles.usd").as_posix(), wp.vec3(0.0, 0.0, 0.0))
         else:
