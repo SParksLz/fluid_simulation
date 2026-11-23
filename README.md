@@ -12,6 +12,12 @@ An experimental fluid simulation repository built on NVIDIA Warp, with Newton-in
 
 [Full APIC video (MP4)](resources/apic.mp4)
 
+### Coffee and Milk Mixing with RTX SSFR
+
+[![Coffee and milk mixing rendered with RTX SSFR](resources/ssfr_coffee_milk_preview.gif)](resources/ssfr_coffee_milk.mp4)
+
+[Full 2560×1440 video (MP4)](resources/ssfr_coffee_milk.mp4) · [Reproduce the demo](examples/mixing/optics/README.md)
+
 ### WCSPH Demo
 
 ![WCSPH Demo](resources/wsph_demo_02.gif)
