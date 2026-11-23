@@ -620,7 +620,7 @@ class SolverAPIC(SolverBase):
             )
         )
 
-    def __init__(self, model: newton.Model, config: Config):
+    def __init__(self, model: newton.Model, config: Config, *, grid_capacity_positions: wp.array | None = None):
         super().__init__(model=model)
         self.config = config
         self.temporary_store = fem.TemporaryStore()
@@ -660,7 +660,12 @@ class SolverAPIC(SolverBase):
         self._sep_delta: wp.array | None = None
         self._sep_grid_dims: tuple[int, int, int] | None = None
 
-        if model.particle_count > 0:
+        # Reserve space for future emitters without inserting seed particles into the model.
+        if grid_capacity_positions is not None:
+            if len(grid_capacity_positions) == 0 or grid_capacity_positions.device != model.device:
+                raise ValueError("grid_capacity_positions must be nonempty and on the model device")
+            self._ensure_grid(grid_capacity_positions)
+        elif model.particle_count > 0:
             self._ensure_grid(model.state().particle_q)
 
     def get_grid_wireframe(self) -> tuple[wp.array, wp.array] | tuple[None, None]:
@@ -1029,8 +1034,10 @@ class SolverAPIC(SolverBase):
         if self._sep_hash_grid is None or self._sep_grid_dims != (dim_x, dim_y, dim_z):
             self._sep_hash_grid = wp.HashGrid(dim_x, dim_y, dim_z, device=model.device)
             self._sep_grid_dims = (dim_x, dim_y, dim_z)
-        if self._sep_delta is None or int(self._sep_delta.shape[0]) != n:
-            self._sep_delta = wp.empty(n, dtype=wp.vec3, device=model.device)
+        if self._sep_delta is None or int(self._sep_delta.shape[0]) < n:
+            # Reuse storage as emitters grow the active particle prefix.
+            previous = 0 if self._sep_delta is None else int(self._sep_delta.shape[0])
+            self._sep_delta = wp.empty(max(n, 2 * previous), dtype=wp.vec3, device=model.device)
 
         for _ in range(iters):
             self._sep_hash_grid.build(points=state.particle_q, radius=query_radius)

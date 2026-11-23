@@ -1,0 +1,3 @@
+# Additional image dependency for an existing Newton/Warp environment.
+# Simulation dependencies are documented in requirements.txt and the example guide.
+Pillow>=10
